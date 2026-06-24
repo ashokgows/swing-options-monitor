@@ -3,7 +3,7 @@ name: Deploy to GCP VM
 on:
   push:
     branches: [main]
-  workflow_dispatch:   # manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -14,29 +14,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
         with:
-          host:        ${{ secrets.GCP_VM_HOST }}
-          username:    ${{ secrets.GCP_VM_USER }}
-          key:         ${{ secrets.GCP_SSH_PRIVATE_KEY }}
-          port:        22
-          timeout:     60s
-          script: |
-            set -e
-            cd ~/swing-options-monitor
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-            echo "── Pulling latest code ──"
-            git fetch origin main
-            git reset --hard origin/main
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_VM_PROJECT }}
 
-            echo "── Installing dependencies ──"
-            npm ci --omit=dev --quiet
+      - name: Enable OS Login on VM
+        run: |
+          gcloud compute instances add-metadata ${{ secrets.GCP_VM_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --metadata=enable-oslogin=TRUE
 
-            echo "── Restarting bot ──"
-            pm2 restart swing-options-bot --update-env || pm2 start ecosystem.config.js
-            pm2 save
-
-            echo "── Status ──"
-            pm2 list
-            echo "✅ Deploy done at $(date)"
+      - name: Deploy via IAP tunnel (no public SSH port)
+        run: |
+          gcloud compute ssh ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --tunnel-through-iap \
+            --quiet \
+            --command="
+              set -e
+              cd ~/swing-options-monitor
+              echo '── Pulling latest code ──'
+              git fetch origin main
+              git reset --hard origin/main
+              echo '── Installing dependencies ──'
+              npm ci --omit=dev --quiet
+              echo '── Restarting bot ──'
+              pm2 restart swing-options-bot --update-env || pm2 start ecosystem.config.js
+              pm2 save
+              echo '── Status ──'
+              pm2 list
+              echo '✅ Deploy done at \$(date)'
+            "
