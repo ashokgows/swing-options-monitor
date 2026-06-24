@@ -1,28 +1,26 @@
 {
   "name": "swing-options-monitor",
-  "version": "1.0.0",
-  "description": "Daily swing options trade suggester with hourly monitoring",
-  "main": "swing-options-tracker.js",
+  "version": "2.1.0",
+  "description": "Swing options trading bot — Discord-driven, dynamic budget (50% buying power), CALL/PUT only",
+  "main": "swing-options-bot.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node --env-file=.env.production swing-options-tracker.js",
-    "start:once": "node --env-file=.env.production swing-options-tracker.js --once",
-    "monitor": "node --env-file=.env.production swing-options-hourly-monitor.js",
-    "monitor:once": "node --env-file=.env.production swing-options-hourly-monitor.js --once",
-    "backtest": "node --env-file=.env.production swing-options-backtest.js",
-    "check": "node --check swing-options-tracker.js && node --check swing-options-hourly-monitor.js && node --check swing-options-backtest.js"
+    "start": "node --env-file=.env.production swing-options-bot.js",
+    "start:dev": "TEST_MODE=true node --env-file=.env.production swing-options-bot.js",
+    "check": "node --check swing-options-bot.js && node --check webull-integration.js && echo '✅ Syntax OK'"
   },
   "keywords": [
     "trading",
     "options",
     "swing-trading",
     "discord",
-    "automation"
+    "automation",
+    "webull"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "axios": "^1.6.0"
+    "discord.js": "^14.26.4"
   },
   "engines": {
     "node": ">=18.0.0"
