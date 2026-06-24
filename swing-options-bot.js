@@ -124,13 +124,14 @@ function isMarketHours(d = new Date()) {
   return t >= 930 && t < 1600;
 }
 
-// Next Friday expiry date (or following Friday if today is Friday after open)
-function nextFridayExpiry() {
-  const now  = new Date();
-  const et   = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
-  const dow  = et.getDay();
-  const diff = (5 - dow + 7) % 7 || 7;
-  et.setDate(et.getDate() + diff);
+// Optimal expiry: Friday at least 7 calendar days out (avoids high theta decay on 1-2 DTE options)
+function optimalExpiry() {
+  const now = new Date();
+  const et  = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
+  const dow = et.getDay();
+  let daysToFriday = (5 - dow + 7) % 7 || 7;
+  if (daysToFriday < 7) daysToFriday += 7; // ensure at least 7 days out
+  et.setDate(et.getDate() + daysToFriday);
   return `${et.getFullYear()}-${String(et.getMonth() + 1).padStart(2, "0")}-${String(et.getDate()).padStart(2, "0")}`;
 }
 
@@ -550,7 +551,13 @@ async function sendApproval(client, content) {
 
 // ── SCANNER ───────────────────────────────────────────────────────────────
 
+let _scanning = false; // guard against concurrent scans from overlapping scheduler ticks
+
 async function runScan(client, webull, force = false) {
+  if (_scanning) {
+    console.log(`[${etFull()}] Scan skipped — another scan already running`);
+    return;
+  }
   if (!isMarketHours() && !force) {
     console.log(`[${etFull()}] Scan skipped — outside market hours`);
     return;
@@ -566,6 +573,8 @@ async function runScan(client, webull, force = false) {
     return;
   }
 
+  _scanning = true;
+  try {
   // ── Daily loss guard ──────────────────────────────────────────────────────
   if (isDailyLossExceeded()) {
     const pnl = getDailyPnL();
@@ -577,8 +586,9 @@ async function runScan(client, webull, force = false) {
   const budget = await calcTradeBudget(webull);
   console.log(`[${etFull()}] Trade budget: $${budget}`);
 
-  console.log(`[${etFull()}] Scanning ${ELIGIBLE_SYMBOLS.length} symbols...`);
-  await sendMsg(client, `🔍 **SCANNING** ${ELIGIBLE_SYMBOLS.length} symbols... _(${etFull()})_`);
+  const scanList = ELIGIBLE_SYMBOLS.filter(s => s !== "SPY" && webull.isSymbolAllowed(s));
+  console.log(`[${etFull()}] Scanning ${scanList.length} symbols...`);
+  await sendMsg(client, `🔍 **SCANNING** ${scanList.length} symbols... _(${etFull()})_`);
 
   // ── 1. Parallel pre-scan: market trend (SPY) + VIX + earnings ────────────
   let marketTrend = "NEUTRAL";
@@ -609,22 +619,25 @@ async function runScan(client, webull, force = false) {
     return;
   }
 
-  // ── 2. Scan symbols (apply whitelist filter if configured) ────────────────
-  const setups   = [];
-  const scanList = ELIGIBLE_SYMBOLS.filter(s => s !== "SPY" && webull.isSymbolAllowed(s));
+  // ── 2. Scan symbols in parallel batches of 10 ────────────────────────────
+  const setups         = [];
   let   earningsSkipped = 0;
+  const BATCH_SIZE     = 10;
 
-  for (const symbol of scanList) {
-    // Skip earnings risk
-    if (earningsSet.has(symbol)) { earningsSkipped++; continue; }
-
-    try {
-      const bars = await webull.getBars(symbol, "1d", 30);
-      if (!bars || bars.length < 22) continue;
-      const setup = scoreSetup(symbol, bars, marketTrend);
-      if (setup) setups.push(setup);
-    } catch (err) {
-      if (process.env.DEBUG_WEBULL) console.error(`[${etFull()}] ${symbol}: ${err.message}`);
+  for (let i = 0; i < scanList.length; i += BATCH_SIZE) {
+    const batch = scanList.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(async (symbol) => {
+        if (earningsSet.has(symbol)) return { _earningsSkip: true };
+        const bars = await webull.getBars(symbol, "1d", 30);
+        if (!bars || bars.length < 22) return null;
+        return scoreSetup(symbol, bars, marketTrend);
+      })
+    );
+    for (const r of results) {
+      if (r.status !== "fulfilled" || !r.value) continue;
+      if (r.value._earningsSkip) { earningsSkipped++; continue; }
+      setups.push(r.value);
     }
   }
 
@@ -642,7 +655,7 @@ async function runScan(client, webull, force = false) {
   // ── 3. Pick best setup + real option chain pricing ───────────────────────
   setups.sort((a, b) => b.score - a.score);
   const best   = setups[0];
-  const expiry = nextFridayExpiry();
+  const expiry = optimalExpiry(); // 7-14 days out to avoid excessive theta decay
 
   // Attempt to get real bid/ask from Webull option chain; fall back to Black-Scholes
   let chainData = null;
@@ -716,12 +729,24 @@ async function runScan(client, webull, force = false) {
       console.log(`[${etFull()}] Pending approval for ${best.symbol} expired`);
     }
   }, APPROVAL_TIMEOUT);
+
+  } finally {
+    _scanning = false;
+  }
 }
 
 // ── ORDER MANAGEMENT ───────────────────────────────────────────────────────
 
 async function placeTradeOrder(client, webull, approval) {
   const { symbol, direction, position } = approval;
+
+  // Guard: reject if a trade was already opened since approval was sent
+  const currentState = loadState();
+  if (currentState.activeTrades.length > 0) {
+    await sendMsg(client, `⚠️ **Order blocked** — ${currentState.activeTrades.length} trade(s) already active. Only 1 position at a time.`);
+    return;
+  }
+
   console.log(`[${etFull()}] Placing ${direction} order: ${symbol} $${position.strike} exp ${position.expiryDate}`);
 
   try {
@@ -857,16 +882,33 @@ async function monitor5Min(client, webull) {
 
   for (const trade of [...state.activeTrades]) {
     try {
-      // Get current underlying price
-      const bars = await webull.getBars(trade.symbol, "1d", 30);
+      // Fetch intraday snapshot (real-time price) + daily bars (vol) in parallel
+      const [snapResult, barsResult] = await Promise.allSettled([
+        webull.getSnapshot(trade.symbol),
+        webull.getBars(trade.symbol, "1d", 30),
+      ]);
+      const bars = barsResult.status === "fulfilled" ? barsResult.value : null;
       if (!bars || bars.length === 0) continue;
 
-      const spot       = bars[bars.length - 1].close;
+      const snap       = snapResult.status === "fulfilled" ? snapResult.value : null;
+      const spot       = (snap?.last > 0) ? snap.last : bars[bars.length - 1].close;
       const vol        = Math.max(calcVolatility(bars.map(b => b.close).slice(-10)), 0.005);
       const sigma      = vol * Math.sqrt(252);
       const T          = daysUntil(trade.position.expiryDate) / 365;
       const curPremium = Math.round(blackScholes(spot, trade.position.strike, T, sigma, trade.direction) * 100) / 100;
       const pct        = Math.round((curPremium - trade.entryPremium) / trade.entryPremium * 100 * 10) / 10;
+
+      // Trailing stop: after TP1, trail activeSL 15% below rolling peak premium
+      if (trade.tp1Hit) {
+        if (!trade.peakPremium || curPremium > trade.peakPremium) {
+          trade.peakPremium = curPremium;
+        }
+        const trailSL = Math.round(trade.peakPremium * 0.85 * 100) / 100;
+        if (trailSL > trade.activeSL) {
+          trade.activeSL = trailSL;
+          console.log(`[${etFull()}] Trailing SL → $${trailSL.toFixed(2)} (${trade.symbol} peak $${trade.peakPremium.toFixed(2)})`);
+        }
+      }
 
       // Update current premium in state
       trade.currentPremium = curPremium;
@@ -953,6 +995,15 @@ async function monitor5Min(client, webull) {
         continue;
       }
 
+      // ── Theta decay exit: DTE ≤ 2 + past 3:15 PM + no TP1 hit → exit early ──
+      const dte = T * 365;
+      const { hour: hh, min: mm } = getEtParts();
+      if (dte <= 2 && (hh * 100 + mm) >= 1515 && !trade.tp1Hit) {
+        await closePosition(client, trade,
+          `Theta exit — ${dte.toFixed(1)} DTE, cutting before overnight decay`, webull);
+        continue;
+      }
+
     } catch (err) {
       console.error(`[${etFull()}] Monitor error for ${trade.symbol}: ${err.message}`);
     }
@@ -985,28 +1036,48 @@ async function post15MinUpdate(client) {
 
 function calcStats(trades) {
   if (!trades || trades.length === 0) return null;
-  const wins    = trades.filter(t => t.totalPnL > 0);
-  const losses  = trades.filter(t => t.totalPnL <= 0);
-  const total   = Math.round(trades.reduce((a, t) => a + t.totalPnL, 0) * 100) / 100;
-  const avgWin  = wins.length   ? Math.round(wins.reduce((a, t)   => a + t.totalPnL, 0) / wins.length   * 100) / 100 : 0;
-  const avgLoss = losses.length ? Math.round(losses.reduce((a, t) => a + t.totalPnL, 0) / losses.length * 100) / 100 : 0;
-  const best    = trades.reduce((a, t) => t.totalPnL > a.totalPnL ? t : a, trades[0]);
-  const worst   = trades.reduce((a, t) => t.totalPnL < a.totalPnL ? t : a, trades[0]);
-  return { count: trades.length, wins: wins.length, losses: losses.length, total, avgWin, avgLoss, best, worst };
+  const wins        = trades.filter(t => t.totalPnL > 0);
+  const losses      = trades.filter(t => t.totalPnL <= 0);
+  const total       = Math.round(trades.reduce((a, t) => a + t.totalPnL, 0) * 100) / 100;
+  const avgWin      = wins.length   ? Math.round(wins.reduce((a, t)   => a + t.totalPnL, 0) / wins.length   * 100) / 100 : 0;
+  const avgLoss     = losses.length ? Math.round(losses.reduce((a, t) => a + t.totalPnL, 0) / losses.length * 100) / 100 : 0;
+  const grossProfit = wins.reduce((a, t) => a + t.totalPnL, 0);
+  const grossLoss   = Math.abs(losses.reduce((a, t) => a + t.totalPnL, 0));
+  const profitFactor = grossLoss > 0 ? Math.round(grossProfit / grossLoss * 100) / 100 : null;
+  const rr           = avgLoss < 0  ? Math.round(avgWin / Math.abs(avgLoss) * 100) / 100 : null;
+  const best  = trades.reduce((a, t) => t.totalPnL > a.totalPnL ? t : a, trades[0]);
+  const worst = trades.reduce((a, t) => t.totalPnL < a.totalPnL ? t : a, trades[0]);
+
+  // Per-symbol breakdown (top 3 by count)
+  const bySym = {};
+  for (const t of trades) {
+    if (!bySym[t.symbol]) bySym[t.symbol] = { count: 0, pnl: 0 };
+    bySym[t.symbol].count++;
+    bySym[t.symbol].pnl += t.totalPnL;
+  }
+  const topSymbols = Object.entries(bySym)
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, 3)
+    .map(([sym, d]) => `${sym} (${d.count}x, $${Math.round(d.pnl * 100) / 100 >= 0 ? "+" : ""}${Math.round(d.pnl * 100) / 100})`);
+
+  return { count: trades.length, wins: wins.length, losses: losses.length, total, avgWin, avgLoss, profitFactor, rr, best, worst, topSymbols };
 }
 
 function formatPerfReport(label, stats) {
   if (!stats) return `📊 **${label} Performance** — No completed trades yet`;
   const topEmoji  = stats.total >= 0 ? "✅" : "❌";
   const winRate   = Math.round(stats.wins / stats.count * 100);
+  const rrStr     = stats.rr !== null ? `${stats.rr.toFixed(2)}:1` : "N/A";
+  const pfStr     = stats.profitFactor !== null ? stats.profitFactor.toFixed(2) : "N/A";
   return (
     `📊 **${label} Performance Report** — ${etFull()}\n\n` +
     `${topEmoji} **Net P&L: $${stats.total.toFixed(2)}**\n\n` +
-    `• Trades:   ${stats.count} (${stats.wins}W / ${stats.losses}L) · Win Rate: ${winRate}%\n` +
-    `• Avg Win:  +$${stats.avgWin.toFixed(2)}\n` +
-    `• Avg Loss: $${stats.avgLoss.toFixed(2)}\n` +
-    `• Best:     ${stats.best.symbol} ${stats.best.direction} +$${stats.best.totalPnL.toFixed(2)}\n` +
-    `• Worst:    ${stats.worst.symbol} ${stats.worst.direction} $${stats.worst.totalPnL.toFixed(2)}`
+    `• Trades:         ${stats.count} (${stats.wins}W / ${stats.losses}L) · Win Rate: ${winRate}%\n` +
+    `• Avg Win:        +$${stats.avgWin.toFixed(2)} · Avg Loss: $${stats.avgLoss.toFixed(2)}\n` +
+    `• Risk/Reward:    ${rrStr} · Profit Factor: ${pfStr}\n` +
+    `• Best:           ${stats.best.symbol} ${stats.best.direction} +$${stats.best.totalPnL.toFixed(2)}\n` +
+    `• Worst:          ${stats.worst.symbol} ${stats.worst.direction} $${stats.worst.totalPnL.toFixed(2)}\n` +
+    (stats.topSymbols.length ? `• Top symbols:    ${stats.topSymbols.join(" · ")}` : "")
   );
 }
 
