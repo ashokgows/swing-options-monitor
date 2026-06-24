@@ -609,9 +609,9 @@ async function runScan(client, webull, force = false) {
     return;
   }
 
-  // ── 2. Scan symbols ───────────────────────────────────────────────────────
+  // ── 2. Scan symbols (apply whitelist filter if configured) ────────────────
   const setups   = [];
-  const scanList = ELIGIBLE_SYMBOLS.filter(s => s !== "SPY");
+  const scanList = ELIGIBLE_SYMBOLS.filter(s => s !== "SPY" && webull.isSymbolAllowed(s));
   let   earningsSkipped = 0;
 
   for (const symbol of scanList) {
