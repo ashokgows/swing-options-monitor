@@ -9,6 +9,7 @@
  */
 
 const TZ = "America/New_York";
+const axios = require("axios");
 
 function log(msg) {
   const t = new Intl.DateTimeFormat("en-US", {
@@ -33,6 +34,23 @@ class WebullClient {
       ? "https://openapi.webull.com/openapi"
       : "https://openapi-test.webull.com/openapi";
 
+    // Axios client with proxy support (if WEBULL_PROXY_URL is set)
+    const proxyUrl = process.env.WEBULL_PROXY_URL;
+    const axiosConfig = {
+      timeout: 12000,
+      headers: { "User-Agent": "SwingOptionsBot/2.1" },
+    };
+    if (proxyUrl) {
+      const url = new URL(proxyUrl);
+      axiosConfig.proxy = {
+        protocol: url.protocol.replace(":", ""),
+        host: url.hostname,
+        port: parseInt(url.port || (url.protocol === "https:" ? 443 : 80), 10),
+      };
+      log(`Configured proxy: ${proxyUrl}`);
+    }
+    this.axiosClient = axios.create(axiosConfig);
+
     this._token       = null;
     this._tokenExpiry = 0;
     this._debug       = process.env.DEBUG_WEBULL === "true";
@@ -54,22 +72,21 @@ class WebullClient {
     this.validateCredentials();
     if (this._debug) log("Refreshing access token...");
 
-    const resp = await fetch(`${this.baseUrl}/oauth/token`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({
+    let data;
+    try {
+      const resp = await this.axiosClient.post(`${this.baseUrl}/oauth/token`, {
         grant_type: "client_credentials",
         app_key:    this.appKey,
         app_secret: this.appSecret,
-      }),
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text();
-      throw new Error(`Webull auth failed (${resp.status}): ${text}`);
+      });
+      data = resp.data;
+    } catch (e) {
+      // Network error - likely CloudFront blocking
+      if (e.code === "ECONNABORTED" || e.message.includes("timeout")) {
+        throw new Error(`Webull API timeout (CloudFront may be blocking GCP IP 34.31.67.213). Set WEBULL_PROXY_URL to bypass. Contact Webull: "API calls from 34.31.67.213 timeout at CloudFront. IP is whitelisted in dashboard but CDN blocks it."`);
+      }
+      throw new Error(`Webull API error: ${e.message} (code: ${e.code})`);
     }
-
-    const data = await resp.json();
     // Webull may return accessToken or access_token
     this._token       = data.accessToken || data.access_token || data.token;
     this._tokenExpiry = Date.now() + ((data.expires_in || 86400) - 120) * 1000;
@@ -83,27 +100,27 @@ class WebullClient {
 
   async request(method, path, body = null, params = null) {
     const token   = await this.getToken();
-    const url     = new URL(`${this.baseUrl}${path}`);
-    if (params) Object.entries(params).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
-
-    const opts = {
+    const url     = `${this.baseUrl}${path}`;
+    const config  = {
       method,
       headers: {
         "Authorization": `Bearer ${token}`,
         "Content-Type":  "application/json",
       },
     };
-    if (body) opts.body = JSON.stringify(body);
+    if (params) config.params = params;
+    if (body) config.data = body;
 
-    if (this._debug) log(`${method} ${url.pathname}${url.search}`);
+    if (this._debug) log(`${method} ${path}${params ? "?" + new URLSearchParams(params) : ""}`);
 
-    const resp = await fetch(url, opts);
-    const text = await resp.text();
-
-    if (!resp.ok) throw new Error(`Webull API ${method} ${path}: HTTP ${resp.status} — ${text}`);
-
-    try { return JSON.parse(text); }
-    catch { return text; }
+    try {
+      const resp = await this.axiosClient(url, config);
+      return resp.data;
+    } catch (e) {
+      const status = e.response?.status;
+      const text = e.response?.data || e.message;
+      throw new Error(`Webull API ${method} ${path}: HTTP ${status || "error"} — ${JSON.stringify(text).substring(0, 100)}`);
+    }
   }
 
   // ── MARKET DATA ───────────────────────────────────────────────────────────
