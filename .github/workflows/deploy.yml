@@ -24,19 +24,33 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_VM_PROJECT }}
 
-      - name: Enable OS Login on VM
+      - name: Write SSH private key
         run: |
-          gcloud compute instances add-metadata ${{ secrets.GCP_VM_NAME }} \
-            --zone=${{ secrets.GCP_VM_ZONE }} \
-            --metadata=enable-oslogin=TRUE
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GCP_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-      - name: Deploy via IAP tunnel (no public SSH port)
+      - name: Open IAP TCP tunnel and deploy
         run: |
-          gcloud compute ssh ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_NAME }} \
+          # Start IAP TCP tunnel: routes localhost:2222 → VM:22 via Google's IAP
+          gcloud compute start-iap-tunnel \
+            ${{ secrets.GCP_VM_NAME }} 22 \
+            --local-host-port=localhost:2222 \
             --zone=${{ secrets.GCP_VM_ZONE }} \
-            --tunnel-through-iap \
-            --quiet \
-            --command="
+            --project=${{ secrets.GCP_VM_PROJECT }} &
+          IAP_PID=$!
+
+          # Give tunnel a moment to establish
+          sleep 6
+
+          # Deploy over the tunnel
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -p 2222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=30 \
+            ${{ secrets.GCP_VM_USER }}@localhost "
               set -e
               cd ~/swing-options-monitor
               echo '── Pulling latest code ──'
@@ -51,3 +65,5 @@ jobs:
               pm2 list
               echo '✅ Deploy done at \$(date)'
             "
+
+          kill $IAP_PID 2>/dev/null || true
