@@ -114,9 +114,12 @@ class WebullClient {
     if (this._debug) log(`${method} ${path}${params ? "?" + new URLSearchParams(params) : ""}`);
 
     try {
-      const resp = await this.axiosClient(url, config);
+      const resp = await this.axiosClient.request({ url, ...config });
       return resp.data;
     } catch (e) {
+      if (e.code === "ECONNABORTED" || e.message.includes("timeout")) {
+        throw new Error(`Webull API timeout on ${method} ${path} — may need WEBULL_PROXY_URL`);
+      }
       const status = e.response?.status;
       const text = e.response?.data || e.message;
       throw new Error(`Webull API ${method} ${path}: HTTP ${status || "error"} — ${JSON.stringify(text).substring(0, 100)}`);
