@@ -650,7 +650,9 @@ async function runScan(client, webull, force = false) {
   try {
     chainData   = await webull.getOptionChain(best.symbol, expiry);
     priceSource = "live bid/ask";
-  } catch { /* option chain not available — use Black-Scholes */ }
+  } catch (e) {
+    console.warn(`[${etFull()}] Option chain unavailable for ${best.symbol} (geo-blocked API): ${e.message} — using Black-Scholes estimate`);
+  }
 
   const position = chainData && chainData.length > 0
     ? calcOptionPositionFromChain(chainData, best.direction, expiry, budget)
@@ -681,8 +683,9 @@ async function runScan(client, webull, force = false) {
     `• Expiry:    ${position.expiryDate}\n` +
     `• Premium:   $${position.premium.toFixed(2)}/contract (×100 shares)\n` +
     `• Contracts: ${position.contracts}\n` +
-    `• **Total Cost: $${position.totalCost.toFixed(2)}** (budget: $${budget} — ${budgetSrc})\n\n` +
-    `🎯 **Levels (on premium):**\n` +
+    `• **Total Cost: $${position.totalCost.toFixed(2)}** (budget: $${budget} — ${budgetSrc})\n` +
+    (priceSource === "Black-Scholes est." ? `⚠️ _**Premium is estimated** — check Webull for actual bid/ask before approving_\n` : "") +
+    `\n🎯 **Levels (on premium):**\n` +
     `• SL:  $${position.sl.toFixed(2)}  (−25%)\n` +
     `• TP1: $${position.tp1.toFixed(2)} (+30%) → SL moves to breakeven\n` +
     `• TP2: $${position.tp2.toFixed(2)} (+60%) → Close position\n\n` +
