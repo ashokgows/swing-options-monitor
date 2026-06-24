@@ -1,0 +1,30 @@
+{
+  "name": "swing-options-monitor",
+  "version": "1.0.0",
+  "description": "Daily swing options trade suggester with hourly monitoring",
+  "main": "swing-options-tracker.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node --env-file=.env.production swing-options-tracker.js",
+    "start:once": "node --env-file=.env.production swing-options-tracker.js --once",
+    "monitor": "node --env-file=.env.production swing-options-hourly-monitor.js",
+    "monitor:once": "node --env-file=.env.production swing-options-hourly-monitor.js --once",
+    "backtest": "node --env-file=.env.production swing-options-backtest.js",
+    "check": "node --check swing-options-tracker.js && node --check swing-options-hourly-monitor.js && node --check swing-options-backtest.js"
+  },
+  "keywords": [
+    "trading",
+    "options",
+    "swing-trading",
+    "discord",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

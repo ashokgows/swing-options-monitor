@@ -1,0 +1,10 @@
+node_modules/
+.env.production
+.env
+.DS_Store
+*.log
+.swing-options-state.json
+.swing-options-stats.json
+.swing-options-equity.json
+.swing-options-journey.json
+.swing-options-earnings.json
