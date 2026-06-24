@@ -1352,7 +1352,7 @@ async function main() {
     ],
   });
 
-  client.once("ready", async () => {
+  client.once("clientReady", async () => {
     console.log(`[${etFull()}] Discord bot ready: ${client.user.tag}`);
     startScheduler(client, webull);
 
