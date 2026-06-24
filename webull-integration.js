@@ -110,30 +110,74 @@ class WebullClient {
 
   /**
    * Historical bars (OHLCV).
-   * Webull granularity: "1m" "5m" "15m" "30m" "1h" "d" "1w" "1mo"
+   * Tries Webull first; falls back to Yahoo Finance if Webull is unreachable
+   * (common when running from cloud datacenter IPs that Webull geo-blocks).
    * Returns [{time, open, high, low, close, volume}]
    */
   async getBars(symbol, interval = "1d", count = 30) {
-    const granMap = {
-      "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-      "1h": "1h", "1d": "d",  "1w":  "1w",  "1mo": "1mo",
-    };
-    const granularity = granMap[interval] || "d";
+    // ── 1. Try Webull ────────────────────────────────────────────────────────
+    try {
+      const granMap = {
+        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1h", "1d": "d",  "1w": "1w",   "1mo": "1mo",
+      };
+      const data = await this.request("GET", "/quotes/bars", null, {
+        symbol, granularity: granMap[interval] || "d", count,
+      });
+      const raw = (data?.data) ? data.data : (Array.isArray(data) ? data : []);
+      const bars = raw.map(b => ({
+        time:   b.timestamp || b.time || b.t,
+        open:   parseFloat(b.open   || b.o),
+        high:   parseFloat(b.high   || b.h),
+        low:    parseFloat(b.low    || b.l),
+        close:  parseFloat(b.close  || b.c),
+        volume: parseFloat(b.volume || b.v || 0),
+      })).filter(b => b.close > 0);
+      if (bars.length > 0) return bars;
+    } catch { /* fall through to Yahoo Finance */ }
 
-    const data = await this.request("GET", "/quotes/bars", null, {
-      symbol, granularity, count,
+    // ── 2. Fallback: Yahoo Finance (no API key, accessible from cloud VMs) ───
+    return this._getBarsYahoo(symbol, interval, count);
+  }
+
+  async _getBarsYahoo(symbol, interval = "1d", count = 30) {
+    // Map our interval codes to Yahoo's
+    const yhInterval = { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+                         "1h": "60m", "1d": "1d", "1w": "1wk", "1mo": "1mo" }[interval] || "1d";
+    // Request more range than count to ensure we get enough bars
+    const rangeMap   = { "1m": "7d", "5m": "7d", "15m": "60d", "30m": "60d",
+                         "1h": "60d", "1d": "3mo", "1w": "2y", "1mo": "5y" };
+    const range      = rangeMap[interval] || "3mo";
+
+    // Yahoo Finance uses different ticker formats for some symbols
+    const yhSym = symbol.startsWith("^") ? symbol : encodeURIComponent(symbol);
+    const url   = `https://query2.finance.yahoo.com/v8/finance/chart/${yhSym}` +
+                  `?range=${range}&interval=${yhInterval}&events=div`;
+
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal:  AbortSignal.timeout(8000),
     });
+    if (!resp.ok) throw new Error(`Yahoo Finance HTTP ${resp.status} for ${symbol}`);
 
-    // Webull may nest under data.data or return array directly
-    const raw = (data && data.data) ? data.data : (Array.isArray(data) ? data : []);
-    return raw.map(b => ({
-      time:   b.timestamp || b.time || b.t,
-      open:   parseFloat(b.open   || b.o),
-      high:   parseFloat(b.high   || b.h),
-      low:    parseFloat(b.low    || b.l),
-      close:  parseFloat(b.close  || b.c),
-      volume: parseFloat(b.volume || b.v || 0),
+    const json       = await resp.json();
+    const result     = json?.chart?.result?.[0];
+    if (!result)     throw new Error(`Yahoo Finance: no data for ${symbol}`);
+
+    const timestamps = result.timestamp || [];
+    const q          = result.indicators.quote[0];
+
+    const bars = timestamps.map((t, i) => ({
+      time:   t * 1000,
+      open:   parseFloat(q.open[i]   || 0),
+      high:   parseFloat(q.high[i]   || 0),
+      low:    parseFloat(q.low[i]    || 0),
+      close:  parseFloat(q.close[i]  || 0),
+      volume: parseFloat(q.volume[i] || 0),
     })).filter(b => b.close > 0);
+
+    // Return only the last `count` bars
+    return bars.slice(-count);
   }
 
   /**
@@ -141,16 +185,34 @@ class WebullClient {
    * Returns {symbol, last, bid, ask, change, changePercent, volume}
    */
   async getSnapshot(symbol) {
-    const data = await this.request("GET", "/quotes/snapshot", null, { symbol });
-    const raw  = data?.data?.[0] || data?.[0] || data;
+    // Try Webull first, fall back to Yahoo Finance
+    try {
+      const data = await this.request("GET", "/quotes/snapshot", null, { symbol });
+      const raw  = data?.data?.[0] || data?.[0] || data;
+      const last = parseFloat(raw.close || raw.last || raw.price || 0);
+      if (last > 0) return {
+        symbol,
+        last,
+        bid:           parseFloat(raw.bid || 0),
+        ask:           parseFloat(raw.ask || 0),
+        change:        parseFloat(raw.change || 0),
+        changePercent: parseFloat(raw.changeRatio || raw.changePercent || 0),
+        volume:        parseFloat(raw.volume || 0),
+      };
+    } catch { /* fall through */ }
+
+    // Yahoo Finance fallback
+    const bars = await this._getBarsYahoo(symbol, "1d", 2);
+    if (bars.length < 2) throw new Error(`No snapshot data for ${symbol}`);
+    const prev = bars[bars.length - 2].close;
+    const last = bars[bars.length - 1].close;
     return {
-      symbol:        symbol,
-      last:          parseFloat(raw.close   || raw.last   || raw.price || 0),
-      bid:           parseFloat(raw.bid     || 0),
-      ask:           parseFloat(raw.ask     || 0),
-      change:        parseFloat(raw.change  || 0),
-      changePercent: parseFloat(raw.changeRatio || raw.changePercent || 0),
-      volume:        parseFloat(raw.volume  || 0),
+      symbol,
+      last,
+      bid: 0, ask: 0,
+      change:        Math.round((last - prev) * 100) / 100,
+      changePercent: Math.round((last - prev) / prev * 1000) / 10,
+      volume:        bars[bars.length - 1].volume,
     };
   }
 

@@ -202,17 +202,31 @@ async function calcTradeBudget(webull) {
 // ── VIX REGIME ─────────────────────────────────────────────────────────────
 
 async function getVixLevel(webull) {
-  // Try "VIX" first, fall back to "VIXY" (VIX ETF, lower price but correlated)
-  for (const sym of ["VIX", "^VIX", "VIXY"]) {
+  // 1. Try Webull (works if their API exposes index data)
+  for (const sym of ["VIX", "^VIX"]) {
     try {
       const bars = await webull.getBars(sym, "1d", 5);
-      if (bars && bars.length > 0) {
-        const last = bars[bars.length - 1].close;
-        // VIXY trades ~0.3× VIX — scale it up if needed
-        return sym === "VIXY" ? Math.round(last * 3.3 * 10) / 10 : last;
-      }
+      if (bars && bars.length > 0) return bars[bars.length - 1].close;
     } catch { /* try next */ }
   }
+
+  // 2. Yahoo Finance public endpoint — no key, no auth required
+  try {
+    const resp = await fetch(
+      "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?range=5d&interval=1d",
+      {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        signal: AbortSignal.timeout(6000),
+      }
+    );
+    if (resp.ok) {
+      const json = await resp.json();
+      const closes = json?.chart?.result?.[0]?.indicators?.quote?.[0]?.close ?? [];
+      const last   = closes.filter(Boolean).at(-1);
+      if (last) return Math.round(last * 10) / 10;
+    }
+  } catch { /* fall through */ }
+
   return null;
 }
 
