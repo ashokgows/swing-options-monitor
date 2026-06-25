@@ -133,9 +133,13 @@ function optimalExpiry() {
   return `${et.getFullYear()}-${String(et.getMonth() + 1).padStart(2, "0")}-${String(et.getDate()).padStart(2, "0")}`;
 }
 
-// Days between now and a YYYY-MM-DD date string
+// Days between now (ET) and a YYYY-MM-DD date string (ET, expiry at 4:00 PM)
 function daysUntil(dateStr) {
-  return Math.max(Math.round((new Date(dateStr + "T16:00:00") - Date.now()) / 86400000), 0.01);
+  const now = new Date();
+  const et  = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
+  const [year, month, day] = dateStr.split("-").map(Number);
+  const expiry = new Date(year, month - 1, day, 16, 0, 0);
+  return Math.max(Math.round((expiry - et) / 86400000), 0.01);
 }
 
 // ── STATE MANAGEMENT ───────────────────────────────────────────────────────
@@ -657,7 +661,7 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
     const premium        = blackScholes(spot, strike, T, sigma, direction);
     const costPerContract = premium * 100; // 1 contract = 100 shares
 
-    if (costPerContract < 1)        continue; // too cheap → illiquid/junk
+    if (costPerContract < 5)        continue; // too cheap → illiquid/junk (minimum $5 per contract)
     if (costPerContract > budget)   continue; // exceeds trade budget
 
     // #2: Greeks filter — prefer delta 0.4–0.8 (ATM-ish, high probability, less theta bleed)
@@ -884,7 +888,7 @@ async function runScan(client, webull, force = false) {
   for (const setup of setups) {
     try {
       const bars5m = await webull.getBars(setup.symbol, "5m", 20);
-      if (bars5m && bars5m.length >= 10) {
+      if (bars5m && bars5m.length >= 11) {
         const closes5m = bars5m.map(b => b.close);
         const rsi5m    = calcRSI(closes5m, 10);
         const ok = (setup.direction === "CALL" && rsi5m > 45) ||
@@ -910,7 +914,7 @@ async function runScan(client, webull, force = false) {
   if (!best) {
     await sendMsg(client,
       `🔍 **SCAN COMPLETE** — ${setups.length} setup(s) rejected by 5m confirmation _(${etFull()})_\n` +
-      earningsNote +
+      (earningsNote || ivNote ? `${earningsNote}${ivNote}\n` : "") +
       `VIX: ${vixInfo.emoji} ${vixInfo.label}`
     );
     return;
@@ -954,6 +958,7 @@ async function runScan(client, webull, force = false) {
   const dirEmoji  = best.direction === "CALL" ? "📈" : "📉";
   const runners   = setups.slice(1, 4).map(s => `${s.symbol} ${s.direction} (${s.score})`).join(", ");
   const budgetSrc = budget === FALLBACK_BUDGET ? `fallback (balance API unavailable)` : budget < 300 ? `95% of $${Math.round(budget / 0.95)} balance` : `50% of balance`;
+  const isDTE0 = position.expiryDate === etDateStr() ? " 🏃 **0DTE** (expires TODAY)" : "";
 
   const proposalText =
     `${dirEmoji} **TRADE SETUP** — ${etFull()}\n` +
@@ -961,7 +966,7 @@ async function runScan(client, webull, force = false) {
     (earningsNote ? earningsNote : "") +
     `\n**${best.symbol} ${best.direction}** · Score: ${best.score}/100\n\n` +
     `📊 **Signals:**\n${best.reasons.map(r => `• ${r}`).join("\n")}\n\n` +
-    `📋 **Option Contract** _(${priceSource})_:\n` +
+    `📋 **Option Contract** _(${priceSource})_${isDTE0}:\n` +
     `• Strike:    $${position.strike.toFixed(2)}\n` +
     `• Expiry:    ${position.expiryDate}\n` +
     `• Premium:   $${position.premium.toFixed(2)}/contract (×100 shares)\n` +
