@@ -7,7 +7,11 @@
   "scripts": {
     "start": "node --env-file=.env.production swing-options-bot.js",
     "start:dev": "TEST_MODE=true node --env-file=.env.production swing-options-bot.js",
-    "check": "node --check swing-options-bot.js && node --check webull-integration.js && echo '✅ Syntax OK'"
+    "check": "node --check swing-options-bot.js && node --check webull-integration.js && echo '✅ Syntax OK'",
+    "test": "jest --coverage",
+    "test:unit": "jest tests/unit.test.js",
+    "test:integration": "jest tests/integration.test.js",
+    "test:watch": "jest --watch"
   },
   "keywords": [
     "trading",
@@ -22,6 +26,9 @@
   "dependencies": {
     "axios": "^1.7.0",
     "discord.js": "^14.26.4"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   },
   "engines": {
     "node": ">=18.0.0"
