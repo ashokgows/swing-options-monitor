@@ -30,16 +30,13 @@ const PERF_FILE  = path.join(process.cwd(), ".swing-options-performance.json");
 const MIN_BUDGET          = 10;    // absolute floor — won't trade with less than $10
 const FALLBACK_BUDGET     = parseFloat(process.env.MAX_TRADE_BUDGET || "76"); // used when balance API is unavailable
 const ABSOLUTE_MAX_BUDGET = parseInt(process.env.ABSOLUTE_MAX_BUDGET || "2000", 10);
-const BUYING_POWER_RATIO  = 0.95;  // use 95% of balance when small (<$300), 50% otherwise
 const CHANNEL_ID          = process.env.DISCORD_CHANNEL_ID;
 const APPROVAL_TIMEOUT    = 10 * 60 * 1000;
 
-const MAX_DAILY_LOSS = parseFloat(process.env.MAX_DAILY_LOSS || "150"); // $ loss before halting
-
-// Option P/L targets as multipliers of entry premium
-const TP1_MULT = 1.30;  // +30%
-const TP2_MULT = 1.60;  // +60%
-const SL_MULT  = 0.75;  // -25%
+const DAILY_LOSS_PCT       = 0.25;  // halt when daily loss > 25% of balance
+const SL_MULT              = 0.80;  // −20% initial stop loss
+const PROFIT_TRAIL_TRIGGER = 1.15;  // activate trailing floor when up 15%
+const PROFIT_TRAIL_PCT     = 0.88;  // trail floor at 88% of peak (12% pullback allowed)
 
 // Top 100 S&P 500 components (by market cap) + major sector/index ETFs
 const ELIGIBLE_SYMBOLS = [
@@ -176,8 +173,15 @@ function getDailyPnL() {
     .reduce((s, t) => s + t.totalPnL, 0);
 }
 
+function getDailyLossLimit() {
+  // 25% of last known balance; falls back to 25% of FALLBACK_BUDGET / 0.95
+  const state   = loadState();
+  const balance = state.lastKnownBalance || (FALLBACK_BUDGET / 0.95);
+  return Math.round(balance * DAILY_LOSS_PCT * 100) / 100;
+}
+
 function isDailyLossExceeded() {
-  return getDailyPnL() <= -Math.abs(MAX_DAILY_LOSS);
+  return getDailyPnL() <= -getDailyLossLimit();
 }
 
 // ── DYNAMIC BUDGET ─────────────────────────────────────────────────────────
@@ -193,6 +197,11 @@ async function calcTradeBudget(webull) {
       bal?.optionBuyingPower || bal?.buyingPower || bal?.cash || 0
     );
     if (bp > MIN_BUDGET) {
+      // Persist balance for dynamic daily loss limit
+      const s = loadState();
+      s.lastKnownBalance = bp;
+      saveState(s);
+
       const ratio   = bp < 300 ? 0.95 : 0.50;
       const dynamic = Math.round(bp * ratio);
       const budget  = Math.min(Math.max(dynamic, MIN_BUDGET), ABSOLUTE_MAX_BUDGET);
@@ -316,6 +325,33 @@ function calcVolatility(closes) {
   const rets = closes.slice(1).map((c, i) => (c - closes[i]) / closes[i]);
   const mean = rets.reduce((a, b) => a + b) / rets.length;
   return Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length);
+}
+
+/**
+ * Intraday momentum check using 5-min bars.
+ * Returns "WITH" (momentum supports trade), "AGAINST" (turn against), "NEUTRAL"
+ */
+function intradayMomentum(bars5m, direction) {
+  if (!bars5m || bars5m.length < 8) return "NEUTRAL";
+  const closes  = bars5m.map(b => b.close);
+  const period  = Math.min(closes.length - 1, 9);
+  const rsi     = calcRSI(closes, period);
+  const last4   = closes.slice(-4);
+  const allUp   = last4.every((c, i) => i === 0 || c >= last4[i - 1]);
+  const allDown = last4.every((c, i) => i === 0 || c <= last4[i - 1]);
+  // Short-term MA cross
+  const ma3  = closes.slice(-3).reduce((a, b) => a + b) / 3;
+  const ma8  = closes.slice(-8).reduce((a, b) => a + b) / 8;
+  const last = closes[closes.length - 1];
+
+  if (direction === "CALL") {
+    if (rsi < 40 || allDown || last < ma8 * 0.998) return "AGAINST";
+    if (rsi > 55 && (allUp || last > ma3))          return "WITH";
+  } else {
+    if (rsi > 60 || allUp   || last > ma8 * 1.002)  return "AGAINST";
+    if (rsi < 45 && (allDown || last < ma3))         return "WITH";
+  }
+  return "NEUTRAL";
 }
 
 /**
@@ -475,19 +511,15 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
     if (contracts < 1) continue;
 
     const totalCost = Math.round(contracts * costPerContract * 100) / 100;
-    const tp1       = Math.round(premium * TP1_MULT * 100) / 100;
-    const tp2       = Math.round(premium * TP2_MULT * 100) / 100;
-    const sl        = Math.round(premium * SL_MULT  * 100) / 100;
+    const sl        = Math.round(premium * SL_MULT * 100) / 100;
 
     return {
       strike,
       expiryDate,
-      premium:    Math.round(premium * 100) / 100,
+      premium:   Math.round(premium * 100) / 100,
       contracts,
       totalCost,
-      tp1,  // +30% on premium
-      tp2,  // +60% on premium
-      sl,   // -25% on premium
+      sl,        // −20% initial stop loss; trails up dynamically
     };
   }
 
@@ -514,14 +546,12 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
 
     const totalCost = Math.round(contracts * costPerContract * 100) / 100;
     return {
-      strike:     c.strikePrice,
+      strike:    c.strikePrice,
       expiryDate,
-      premium:    Math.round(premium * 100) / 100,
+      premium:   Math.round(premium * 100) / 100,
       contracts,
       totalCost,
-      tp1:        Math.round(premium * TP1_MULT * 100) / 100,
-      tp2:        Math.round(premium * TP2_MULT * 100) / 100,
-      sl:         Math.round(premium * SL_MULT  * 100) / 100,
+      sl:        Math.round(premium * SL_MULT * 100) / 100,
     };
   }
   return null;
@@ -703,10 +733,11 @@ async function runScan(client, webull, force = false) {
     `• Contracts: ${position.contracts}\n` +
     `• **Total Cost: $${position.totalCost.toFixed(2)}** (budget: $${budget} — ${budgetSrc})\n` +
     (priceSource === "Black-Scholes est." ? `⚠️ _**Premium is estimated** — check Webull for actual bid/ask before approving_\n` : "") +
-    `\n🎯 **Levels (on premium):**\n` +
-    `• SL:  $${position.sl.toFixed(2)}  (−25%)\n` +
-    `• TP1: $${position.tp1.toFixed(2)} (+30%) → SL moves to breakeven\n` +
-    `• TP2: $${position.tp2.toFixed(2)} (+60%) → Close position\n\n` +
+    `\n🎯 **Exit Strategy (dynamic):**\n` +
+    `• Initial SL: $${position.sl.toFixed(2)} (−20%)\n` +
+    `• Profit floor: activates at +15%, trails 12% below peak\n` +
+    `• Momentum exit: closes if 5m RSI/price turns against position\n` +
+    `• Profit take: closes at +50% if momentum is fading\n\n` +
     (runners ? `📌 Runners-up: ${runners}\n\n` : "") +
     `_Click ✅ Place Order or ❌ Skip below · 10-min timeout_`;
 
@@ -774,10 +805,10 @@ async function placeTradeOrder(client, webull, approval) {
       orderId:        order?.orderId || `local_${Date.now()}`,
       entryPremium:   position.premium,
       currentPremium: position.premium,
+      peakPremium:    position.premium,
+      profitFloor:    null,       // activates when up 15%, trails below peak
       entryTime:      new Date().toISOString(),
-      status:         "ACTIVE",   // ACTIVE → TP1_HIT → CLOSED
-      tp1Hit:         false,
-      slMoved:        false,      // true once SL moved to entry after TP1
+      status:         "ACTIVE",
       activeSL:       position.sl,
     };
 
@@ -793,11 +824,11 @@ async function placeTradeOrder(client, webull, approval) {
       `• Contracts: ${position.contracts} · Cost: $${position.totalCost.toFixed(2)}\n` +
       `• Strike: $${position.strike.toFixed(2)} · Expiry: ${position.expiryDate}\n` +
       `• Order ID: \`${trade.orderId}\`\n\n` +
-      `🎯 **Monitoring levels:**\n` +
-      `• SL:  $${position.sl.toFixed(2)} (−25%)\n` +
-      `• TP1: $${position.tp1.toFixed(2)} (+30%) → SL moves to breakeven\n` +
-      `• TP2: $${position.tp2.toFixed(2)} (+60%) → Full close\n\n` +
-      `_Monitoring every 5 min · ${etFull()}_`
+      `🎯 **Exit Strategy (dynamic):**\n` +
+      `• Initial SL: $${position.sl.toFixed(2)} (−20%)\n` +
+      `• Profit floor: activates at +15%, trails 12% below peak\n` +
+      `• Momentum exit: closes if intraday trend turns against position\n\n` +
+      `_Monitoring every 2 min · ${etFull()}_`
     );
 
     console.log(`[${etFull()}] Order placed for ${symbol} ${direction} — ID: ${trade.orderId}`);
@@ -850,162 +881,135 @@ async function closePosition(client, trade, reason, webull) {
   });
   savePerf(perf);
 
-  const emoji       = isWin ? "✅" : "❌";
-  const partialLine = partialPnL !== 0
-    ? `• TP1 partial (locked): $${partialPnL.toFixed(2)}\n`
-    : "";
+  const emoji = isWin ? "✅" : "❌";
   await sendMsg(client,
     `${emoji} **POSITION CLOSED** — ${trade.symbol} ${trade.direction}\n\n` +
     `• Entry: $${trade.entryPremium.toFixed(2)} → Exit: $${trade.currentPremium.toFixed(2)}\n` +
-    partialLine +
+    (trade.peakPremium ? `• Peak premium: $${trade.peakPremium.toFixed(2)}\n` : "") +
     `• **Total P&L: $${totalPnL.toFixed(2)}** (${pct >= 0 ? "+" : ""}${pct}%)\n` +
-    `• Contracts closed: ${finalContracts}\n` +
+    `• Contracts: ${finalContracts}\n` +
     `• Reason: ${reason}\n` +
     `• Time: ${etFull()}`
   );
 
   // Check daily loss limit after close
   if (isDailyLossExceeded()) {
-    const dayPnL = getDailyPnL();
+    const dayPnL    = getDailyPnL();
+    const lossLimit = getDailyLossLimit();
     await sendMsg(client,
-      `🛑 **DAILY LOSS LIMIT REACHED** — $${dayPnL.toFixed(2)} (limit: −$${MAX_DAILY_LOSS})\n` +
+      `🛑 **DAILY LOSS LIMIT REACHED** — $${Math.abs(dayPnL).toFixed(2)} lost (limit: 25% = $${lossLimit.toFixed(2)})\n` +
       `Scanning halted for the rest of the trading day. Resumes tomorrow.`
     );
     console.log(`[${etFull()}] Daily loss limit exceeded ($${dayPnL.toFixed(2)}) — scanning paused`);
   }
 }
 
-// ── POSITION MONITOR (every 5 min) ────────────────────────────────────────
+// ── POSITION MONITOR (every 2 min) ────────────────────────────────────────
 
-async function monitor5Min(client, webull) {
+async function monitor2Min(client, webull) {
   if (!isMarketHours()) return;
 
   const state = loadState();
   if (state.activeTrades.length === 0) return;
 
-  console.log(`[${etFull()}] 5-min check — ${state.activeTrades.length} active trade(s)`);
+  console.log(`[${etFull()}] 2-min check — ${state.activeTrades.length} active trade(s)`);
 
   for (const trade of [...state.activeTrades]) {
     try {
-      // Fetch intraday snapshot (real-time price) + daily bars (vol) in parallel
-      const [snapResult, barsResult] = await Promise.allSettled([
-        webull.getSnapshot(trade.symbol),
+      // Fetch intraday 5m bars (momentum) + daily bars (IV/vol) + snapshot in parallel
+      const [snap5mResult, barsResult, snapResult] = await Promise.allSettled([
+        webull.getBars(trade.symbol, "5m", 20),
         webull.getBars(trade.symbol, "1d", 30),
+        webull.getSnapshot(trade.symbol),
       ]);
-      const bars = barsResult.status === "fulfilled" ? barsResult.value : null;
+
+      const bars5m = snap5mResult.status === "fulfilled" ? snap5mResult.value : null;
+      const bars   = barsResult.status   === "fulfilled" ? barsResult.value   : null;
+      const snap   = snapResult.status   === "fulfilled" ? snapResult.value    : null;
+
       if (!bars || bars.length === 0) continue;
 
-      const snap       = snapResult.status === "fulfilled" ? snapResult.value : null;
-      const spot       = (snap?.last > 0) ? snap.last : bars[bars.length - 1].close;
+      // Best available spot price: intraday snapshot → last 5m bar → last daily bar
+      const spot = (snap?.last > 0)
+        ? snap.last
+        : (bars5m?.length > 0 ? bars5m[bars5m.length - 1].close : bars[bars.length - 1].close);
+
       const vol        = Math.max(calcVolatility(bars.map(b => b.close).slice(-10)), 0.005);
       const sigma      = vol * Math.sqrt(252);
       const T          = daysUntil(trade.position.expiryDate) / 365;
       const curPremium = Math.round(blackScholes(spot, trade.position.strike, T, sigma, trade.direction) * 100) / 100;
       const pct        = Math.round((curPremium - trade.entryPremium) / trade.entryPremium * 100 * 10) / 10;
 
-      // Trailing stop: after TP1, trail activeSL 15% below rolling peak premium
-      if (trade.tp1Hit) {
-        if (!trade.peakPremium || curPremium > trade.peakPremium) {
-          trade.peakPremium = curPremium;
-        }
-        const trailSL = Math.round(trade.peakPremium * 0.85 * 100) / 100;
-        if (trailSL > trade.activeSL) {
-          trade.activeSL = trailSL;
-          console.log(`[${etFull()}] Trailing SL → $${trailSL.toFixed(2)} (${trade.symbol} peak $${trade.peakPremium.toFixed(2)})`);
+      // ── Intraday momentum check ───────────────────────────────────────────
+      const momentum = intradayMomentum(bars5m, trade.direction);
+
+      // ── Update peak premium + profit floor (trailing) ─────────────────────
+      if (curPremium > (trade.peakPremium || 0)) trade.peakPremium = curPremium;
+
+      if (curPremium >= trade.entryPremium * PROFIT_TRAIL_TRIGGER) {
+        const floor = Math.round(trade.peakPremium * PROFIT_TRAIL_PCT * 100) / 100;
+        if (!trade.profitFloor || floor > trade.profitFloor) {
+          trade.profitFloor = floor;
+          // Raise the active SL to the profit floor
+          if (floor > trade.activeSL) {
+            trade.activeSL = floor;
+            console.log(`[${etFull()}] Profit floor raised → $${floor.toFixed(2)} (peak $${trade.peakPremium.toFixed(2)})`);
+          }
         }
       }
 
-      // Update current premium in state
+      // Persist updated trade state
       trade.currentPremium = curPremium;
       const s   = loadState();
       const idx = s.activeTrades.findIndex(t => t.id === trade.id);
       if (idx >= 0) s.activeTrades[idx] = trade;
       saveState(s);
 
+      const floorLabel = trade.profitFloor
+        ? ` | Floor: $${trade.profitFloor.toFixed(2)}`
+        : "";
       const logEmoji = pct >= 0 ? "🟢" : "🔴";
-      console.log(`[${etFull()}] ${logEmoji} ${trade.symbol} ${trade.direction}: $${curPremium.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%) | SL: $${trade.activeSL.toFixed(2)} | TP1: $${trade.position.tp1.toFixed(2)} | TP2: $${trade.position.tp2.toFixed(2)}`);
+      console.log(`[${etFull()}] ${logEmoji} ${trade.symbol} ${trade.direction}: $${curPremium.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%) | SL: $${trade.activeSL.toFixed(2)}${floorLabel} | Mom: ${momentum}`);
 
-      // ── TP2 hit → close for full profit ──
-      if (curPremium >= trade.position.tp2) {
-        await closePosition(client, trade, `TP2 hit — $${curPremium.toFixed(2)} ≥ $${trade.position.tp2.toFixed(2)} (+60%)`, webull);
-        continue;
-      }
+      // ── EXIT DECISIONS (priority order) ───────────────────────────────────
 
-      // ── TP1 hit → partial close (if ≥2 contracts) or move SL to breakeven ──
-      if (!trade.tp1Hit && curPremium >= trade.position.tp1) {
-        const totalContracts = trade.position.contracts;
-
-        if (totalContracts >= 2) {
-          // PARTIAL CLOSE: sell half, hold rest for TP2
-          const sellQty    = Math.floor(totalContracts / 2);
-          const keepQty    = totalContracts - sellQty;
-          const partialPnL = Math.round((curPremium - trade.entryPremium) * 100 * sellQty * 100) / 100;
-
-          try {
-            await webull.closeOptionOrder({ ...trade, position: { ...trade.position, contracts: sellQty } });
-          } catch (e) {
-            console.error(`[${etFull()}] Partial close (TP1) error for ${trade.symbol}: ${e.message}`);
-          }
-
-          trade.tp1Hit                = true;
-          trade.slMoved               = true;
-          trade.activeSL              = trade.entryPremium;
-          trade.realizedPnL           = partialPnL;
-          trade.partialCloseContracts = sellQty;
-          trade.position.contracts    = keepQty;
-
-          const s2   = loadState();
-          const idx2 = s2.activeTrades.findIndex(t => t.id === trade.id);
-          if (idx2 >= 0) s2.activeTrades[idx2] = trade;
-          saveState(s2);
-
-          await sendMsg(client,
-            `🎯 **TP1 HIT — PARTIAL CLOSE** — ${trade.symbol} ${trade.direction}\n\n` +
-            `• Sold:   ${sellQty} of ${totalContracts} contracts @ $${curPremium.toFixed(2)} (+${pct}%)\n` +
-            `• 💰 Locked P&L: +$${partialPnL.toFixed(2)}\n` +
-            `• Remaining: ${keepQty} contract(s) — 🛡️ SL at breakeven ($${trade.entryPremium.toFixed(2)})\n` +
-            `• Holding for TP2: $${trade.position.tp2.toFixed(2)} (+60%) · ${etFull()}`
-          );
-        } else {
-          // 1 contract — just move SL
-          trade.tp1Hit  = true;
-          trade.slMoved = true;
-          trade.activeSL = trade.entryPremium;
-
-          const s2   = loadState();
-          const idx2 = s2.activeTrades.findIndex(t => t.id === trade.id);
-          if (idx2 >= 0) s2.activeTrades[idx2] = trade;
-          saveState(s2);
-
-          await sendMsg(client,
-            `🎯 **TP1 HIT** — ${trade.symbol} ${trade.direction}\n\n` +
-            `• Premium: $${curPremium.toFixed(2)} (+${pct}%)\n` +
-            `• 🛡️ SL moved to breakeven → $${trade.entryPremium.toFixed(2)}\n` +
-            `• Holding for TP2: $${trade.position.tp2.toFixed(2)} (+60%) · ${etFull()}`
-          );
-        }
-        continue;
-      }
-
-      // ── SL hit ──
+      // 1. Hard SL hit
       if (curPremium <= trade.activeSL) {
-        const slLabel = trade.slMoved ? "Breakeven SL" : "Initial SL";
-        await closePosition(client, trade, `${slLabel} hit — $${curPremium.toFixed(2)} ≤ $${trade.activeSL.toFixed(2)}`, webull);
+        const slType = trade.profitFloor ? "Profit floor" : "Stop loss";
+        await closePosition(client, trade,
+          `${slType} hit — $${curPremium.toFixed(2)} ≤ $${trade.activeSL.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%)`, webull);
         continue;
       }
 
-      // ── Expiry reached ──
+      // 2. Momentum turned AGAINST position — exit to protect capital
+      if (momentum === "AGAINST") {
+        const againstMsg = trade.direction === "CALL"
+          ? "RSI/price turning bearish on 5m chart"
+          : "RSI/price turning bullish on 5m chart";
+        await closePosition(client, trade,
+          `Momentum exit — ${againstMsg} · $${curPremium.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%)`, webull);
+        continue;
+      }
+
+      // 3. Option expired
       if (T <= 0) {
         await closePosition(client, trade, "Option expired", webull);
         continue;
       }
 
-      // ── Theta decay exit: DTE ≤ 2 + past 3:15 PM + no TP1 hit → exit early ──
+      // 4. Theta decay exit: DTE ≤ 2 past 3:15 PM
       const dte = T * 365;
       const { hour: hh, min: mm } = getEtParts();
-      if (dte <= 2 && (hh * 100 + mm) >= 1515 && !trade.tp1Hit) {
+      if (dte <= 2 && (hh * 100 + mm) >= 1515) {
         await closePosition(client, trade,
-          `Theta exit — ${dte.toFixed(1)} DTE, cutting before overnight decay`, webull);
+          `Theta exit — ${dte.toFixed(1)} DTE, cutting before overnight decay · $${curPremium.toFixed(2)}`, webull);
+        continue;
+      }
+
+      // 5. Strong profit + momentum neutral/fading → take profit
+      if (pct >= 50 && momentum !== "WITH") {
+        await closePosition(client, trade,
+          `Profit secured — +${pct}% with fading momentum · $${curPremium.toFixed(2)}`, webull);
         continue;
       }
 
@@ -1022,12 +1026,12 @@ async function post15MinUpdate(client) {
   if (state.activeTrades.length === 0) return;
 
   const lines = state.activeTrades.map(t => {
-    const pct   = Math.round((t.currentPremium - t.entryPremium) / t.entryPremium * 100 * 10) / 10;
-    const emoji = pct >= 0 ? "🟢" : "🔴";
-    const slLabel = t.slMoved ? "BE" : "SL";
+    const pct       = Math.round((t.currentPremium - t.entryPremium) / t.entryPremium * 100 * 10) / 10;
+    const emoji     = pct >= 0 ? "🟢" : "🔴";
+    const floorLine = t.profitFloor ? ` · Floor: $${t.profitFloor.toFixed(2)}` : "";
     return (
       `${emoji} **${t.symbol} ${t.direction}** · $${t.currentPremium.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%)\n` +
-      `   ${slLabel}: $${t.activeSL.toFixed(2)} · TP1: $${t.position.tp1.toFixed(2)} · TP2: $${t.position.tp2.toFixed(2)}\n` +
+      `   SL: $${t.activeSL.toFixed(2)}${floorLine} · Peak: $${(t.peakPremium || t.currentPremium).toFixed(2)}\n` +
       `   Strike $${t.position.strike.toFixed(2)} · Exp ${t.position.expiryDate} · ${t.position.contracts} contract(s)`
     );
   });
@@ -1144,14 +1148,13 @@ async function handleCommand(client, webull, msg) {
     }
 
     for (const t of state.activeTrades) {
-      const pct   = Math.round((t.currentPremium - t.entryPremium) / t.entryPremium * 100 * 10) / 10;
-      const emoji = pct >= 0 ? "🟢" : "🔴";
-      const slLabel = t.slMoved ? "🛡️ BE" : "SL";
+      const pct       = Math.round((t.currentPremium - t.entryPremium) / t.entryPremium * 100 * 10) / 10;
+      const emoji     = pct >= 0 ? "🟢" : "🔴";
+      const floorLine = t.profitFloor ? `· Floor: $${t.profitFloor.toFixed(2)} ` : "";
       text += `${emoji} **${t.symbol} ${t.direction}**\n`;
       text += `   Premium: $${t.entryPremium.toFixed(2)} → $${t.currentPremium.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%)\n`;
-      text += `   ${slLabel}: $${t.activeSL.toFixed(2)} · TP1: $${t.position.tp1.toFixed(2)} · TP2: $${t.position.tp2.toFixed(2)}\n`;
-      text += `   Strike $${t.position.strike.toFixed(2)} · Exp ${t.position.expiryDate} · ${t.position.contracts} contract(s)\n`;
-      text += `   TP1 Hit: ${t.tp1Hit ? "✅ (SL at breakeven)" : "Not yet"}\n\n`;
+      text += `   SL: $${t.activeSL.toFixed(2)} ${floorLine}· Peak: $${(t.peakPremium || t.currentPremium).toFixed(2)}\n`;
+      text += `   Strike $${t.position.strike.toFixed(2)} · Exp ${t.position.expiryDate} · ${t.position.contracts} contract(s)\n\n`;
     }
 
     await msg.reply(text.slice(0, 2000));
@@ -1171,10 +1174,11 @@ async function handleCommand(client, webull, msg) {
       `• Market Open:       ${isMarketHours() ? "🟢 Yes" : "🔴 No"}\n` +
       `• Active Trades:     ${state.activeTrades.length}\n` +
       `• Pending Approval:  ${state.pendingApproval ? "⏳ Yes" : "None"}\n` +
-      `• Trade Budget:      $${budget} (50% buying power, min $${MIN_BUDGET})\n` +
+      `• Trade Budget:      $${budget}\n` +
       `• Daily P&L:         $${dayPnL.toFixed(2)} ${lossHalted ? "🛑 HALTED" : ""}\n` +
-      `• Daily Loss Limit:  −$${MAX_DAILY_LOSS}\n` +
-      `• TP1/TP2/SL:        +30% partial-close / +60% full-close / −25%\n` +
+      `• Daily Loss Limit:  −$${getDailyLossLimit().toFixed(2)} (25% of balance)\n` +
+      `• SL:                −20% initial · trails up with profit floor\n` +
+      `• Exit:              Momentum-based · closes when 5m trend turns against\n` +
       `• VIX gate:          skip when VIX > 28\n` +
       `• Earnings filter:   skip ±3 days\n` +
       `• Webull Account:    ${process.env.WEBULL_ACCOUNT_ID}\n` +
@@ -1200,7 +1204,7 @@ async function handleCommand(client, webull, msg) {
       `📅 Schedule (ET):\n` +
       `• 9:30 AM → Market brief\n` +
       `• 9:45 AM → Morning scan (buttons)\n` +
-      `• Every 15min → Rescan · Every 5min → Monitor\n` +
+      `• Every 15min → Rescan · Every 2min → Monitor\n` +
       `• 3:30 PM → Auto-close · 4:00 PM → Reports`
     );
     return;
@@ -1370,10 +1374,10 @@ function startScheduler(client, webull) {
       await runScan(client, webull);
     }
 
-    // Every 5 min during market hours — monitor positions
-    if (isMarketHours() && min % 5 === 0 && !fired.has(`mon_${today}_${hhmm}`)) {
+    // Every 2 min during market hours — monitor positions
+    if (isMarketHours() && min % 2 === 0 && !fired.has(`mon_${today}_${hhmm}`)) {
       fired.add(`mon_${today}_${hhmm}`);
-      await monitor5Min(client, webull);
+      await monitor2Min(client, webull);
     }
 
     // Every 15 min during market hours (skip 9:45) — rescan + status update
@@ -1450,17 +1454,18 @@ async function main() {
     startScheduler(client, webull);
 
     await sendMsg(client,
-      `🤖 **Swing Options Bot v2** — ${etFull()}\n` +
+      `🤖 **Swing Options Bot v2.3** — ${etFull()}\n` +
       `⚠️ OPTIONS TRADING ONLY (CALL/PUT) · **LIVE MODE**\n\n` +
-      `📋 **Config:** Dynamic budget (50% buying power, min $${MIN_BUDGET}) · ${ELIGIBLE_SYMBOLS.length} symbols\n` +
-      `• TP1 +30% → partial close 50% + SL to breakeven · TP2 +60% → Full close · SL −25%\n` +
+      `📋 **Config:** Dynamic budget (scales with balance) · ${ELIGIBLE_SYMBOLS.length} symbols\n` +
+      `• SL −20% · Profit floor at +15%, trails 12% below peak\n` +
+      `• Momentum exit: closes when 5m trend turns against position\n` +
       `• VIX filter: skip when VIX > 28 · Earnings filter: skip ±3 days\n` +
-      `• Daily loss limit: −$${MAX_DAILY_LOSS} · Auto-close 3:30 PM ET\n\n` +
+      `• Daily loss limit: 25% of balance · Auto-close 3:30 PM ET\n\n` +
       `📅 **Schedule (ET):**\n` +
       `• 9:30 AM → Market brief (SPY/QQQ/VIX/gappers)\n` +
       `• 9:45 AM → Morning scan · Buttons: ✅ Place / ❌ Skip\n` +
       `• Every 15 min → Rescan if no open position\n` +
-      `• Every 5 min → Monitor open position\n` +
+      `• Every 2 min → Monitor open position (dynamic exits)\n` +
       `• 3:30 PM → Auto-close · 4:00 PM → Reports\n\n` +
       `💬 **Commands:**\n` +
       `\`!scan\` \`!positions\` \`!close\` \`!cancel\` \`!health\` \`!status\` \`!performance\``
@@ -1532,4 +1537,4 @@ main().catch(err => {
   process.exit(1);
 });
 
-module.exports = { runScan, monitor5Min, calcOptionPosition, scoreSetup, blackScholes };
+module.exports = { runScan, monitor2Min, calcOptionPosition, scoreSetup, blackScholes };
