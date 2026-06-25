@@ -203,9 +203,14 @@ async function calcTradeBudget(webull) {
       saveState(s);
 
       const ratio   = bp < 300 ? 0.95 : 0.50;
-      const dynamic = Math.round(bp * ratio);
+      let dynamic = Math.round(bp * ratio);
+
+      // #3: Scale by recent win rate — 0% WR → 50% of dynamic, 100% WR → 150% of dynamic
+      dynamic = scaleBudgetByWinRate(dynamic);
+
       const budget  = Math.min(Math.max(dynamic, MIN_BUDGET), ABSOLUTE_MAX_BUDGET);
-      console.log(`[${etFull()}] Balance: $${bp.toFixed(2)} → budget $${budget} (${Math.round(ratio * 100)}% of balance)`);
+      const winRate = Math.round(calcRecentWinRate() * 100);
+      console.log(`[${etFull()}] Balance: $${bp.toFixed(2)} → budget $${budget} (${Math.round(ratio * 100)}% base, scaled by ${winRate}% win rate)`);
       return budget;
     }
   } catch (e) {
@@ -380,6 +385,62 @@ function calcEMA(closes, period) {
     ema = closes[i] * k + ema * (1 - k);
   }
   return ema;
+}
+
+// ── DELTA CALCULATION (for Greeks filtering) ─────────────────────────────
+
+function calcDelta(S, K, T, sigma, type) {
+  if (T <= 0) return type === "CALL" ? 1 : 0;
+  const r = 0.05;
+  const d1 = (Math.log(S / K) + (r + (sigma * sigma) / 2) * T) / (sigma * Math.sqrt(T));
+  return type === "CALL" ? cnd(d1) : cnd(d1) - 1;
+}
+
+// ── WIN RATE & POSITION SIZING (#3) ──────────────────────────────────────
+
+function calcRecentWinRate(tradeHistory = null) {
+  const perf = tradeHistory || loadPerf();
+  if (!perf.allTrades || perf.allTrades.length === 0) return 0.5; // default 50%
+  const recent = perf.allTrades.slice(-20);
+  const wins = recent.filter(t => t.totalPnL > 0).length;
+  return recent.length > 0 ? wins / recent.length : 0.5;
+}
+
+function scaleBudgetByWinRate(baseBudget) {
+  const winRate = calcRecentWinRate();
+  // Scale: 0% WR → 50% budget, 50% WR → 100%, 100% WR → 150%
+  const scale = 0.5 + winRate;
+  return Math.round(baseBudget * scale * 100) / 100;
+}
+
+// ── IV PERCENTILE RANK (#4) ──────────────────────────────────────────────
+
+function calcHistVolPercentile(bars) {
+  if (!bars || bars.length < 252) return 0.5; // insufficient data, neutral
+  const closes = bars.map(b => b.close);
+  const allVols = [];
+
+  // Calculate rolling 20-day volatility (approx daily vol)
+  for (let i = 20; i < Math.min(closes.length, 252); i++) {
+    const vol = calcVolatility(closes.slice(i - 20, i));
+    if (vol > 0) allVols.push(vol);
+  }
+
+  if (allVols.length === 0) return 0.5;
+
+  const currentVol = calcVolatility(closes.slice(-20));
+  allVols.sort((a, b) => a - b);
+
+  // Find rank: how many vols are below current?
+  const rank = allVols.filter(v => v <= currentVol).length / allVols.length;
+  return rank;
+}
+
+function isValidIVRank(bars) {
+  const rank = calcHistVolPercentile(bars);
+  // Only trade extremes: < 20th %ile (quiet, skip) or > 80th %ile (volatile, favor)
+  if (rank < 0.2 || rank > 0.8) return true;
+  return false; // mid-range IV, skip to avoid noise
 }
 
 function calcMACD(closes) {
@@ -598,6 +659,10 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
     if (costPerContract < 1)        continue; // too cheap → illiquid/junk
     if (costPerContract > budget)   continue; // exceeds trade budget
 
+    // #2: Greeks filter — prefer delta 0.4–0.8 (ATM-ish, high probability, less theta bleed)
+    const delta = Math.abs(calcDelta(spot, strike, T, sigma, direction));
+    if (delta < 0.4 || delta > 0.8) continue;
+
     const contracts = Math.floor(budget / costPerContract);
     if (contracts < 1) continue;
 
@@ -621,9 +686,20 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
  * Like calcOptionPosition but uses real bid/ask from Webull option chain.
  * Picks the ask price, finds the most contracts within budget, filters by OI > 0.
  */
-function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_BUDGET) {
+function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_BUDGET, spotPrice = null) {
+  // #2: Greeks filter — prefer delta 0.5–0.7 (ATM-ish, high probability)
   const filtered = chain
-    .filter(c => c.optionType === direction && c.openInterest > 0 && c.ask > 0)
+    .filter(c => {
+      if (c.optionType !== direction || c.openInterest <= 0 || c.ask <= 0) return false;
+      // Estimate delta if spot is available
+      if (spotPrice && expiryDate) {
+        const T = daysUntil(expiryDate) / 365;
+        const sigma = 0.25; // rough estimate
+        const delta = Math.abs(calcDelta(spotPrice, c.strikePrice, T, sigma, direction));
+        if (delta < 0.4 || delta > 0.8) return false; // prefer 0.4–0.8 (tighter than old 0.5–0.7)
+      }
+      return true;
+    })
     .sort((a, b) => a.ask - b.ask); // cheapest first
 
   for (const c of filtered) {
@@ -762,6 +838,7 @@ async function runScan(client, webull, force = false) {
   // ── 2b. Scan symbols in parallel batches of 10 ──────────────────────────
   const setups         = [];
   let   earningsSkipped = 0;
+  let   ivSkipped       = 0; // #4: IV filter
   const BATCH_SIZE     = 10;
   const MIN_SCORE      = 45; // #1: only high-conviction setups
 
@@ -772,23 +849,27 @@ async function runScan(client, webull, force = false) {
         if (earningsSet.has(symbol)) return { _earningsSkip: true };
         const bars = await webull.getBars(symbol, "1d", 35);
         if (!bars || bars.length < 22) return null;
+        // #4: IV rank filter — only trade extremes
+        if (!isValidIVRank(bars)) return { _ivSkip: true };
         return scoreSetup(symbol, bars, marketTrend);
       })
     );
     for (const r of results) {
       if (r.status !== "fulfilled" || !r.value) continue;
       if (r.value._earningsSkip) { earningsSkipped++; continue; }
+      if (r.value._ivSkip) { ivSkipped++; continue; }
       if (r.value.score < MIN_SCORE) continue; // #1: skip low-conviction
       setups.push(r.value);
     }
   }
 
-  const earningsNote = earningsSkipped > 0 ? `⚠️ ${earningsSkipped} symbols skipped (earnings risk)\n` : "";
+  const earningsNote = earningsSkipped > 0 ? `⚠️ ${earningsSkipped} symbols skipped (earnings risk) · ` : "";
+  const ivNote = ivSkipped > 0 ? `${ivSkipped} symbols skipped (IV rank mid-range)` : "";
 
   if (setups.length === 0) {
     await sendMsg(client,
       `🔍 **SCAN COMPLETE** — No qualifying setups found _(${etFull()})_\n` +
-      earningsNote +
+      (earningsNote || ivNote ? `${earningsNote}${ivNote}\n` : "") +
       `VIX: ${vixInfo.emoji} ${vixInfo.label}`
     );
     return;
@@ -856,7 +937,7 @@ async function runScan(client, webull, force = false) {
   }
 
   const position = chainData && chainData.length > 0
-    ? calcOptionPositionFromChain(chainData, best.direction, expiry, budget)
+    ? calcOptionPositionFromChain(chainData, best.direction, expiry, budget, best.last) // #2: pass spot for delta filter
     : calcOptionPosition(best.last, best.direction, best.vol, expiry, budget);
 
   if (!position) {
@@ -1134,7 +1215,15 @@ async function monitor2Min(client, webull) {
         continue;
       }
 
-      // 2. Momentum turned AGAINST position — exit to protect capital
+      // 2. Time-based EOD exit (#1) — lock wins by 3:50 PM
+      const { hour: hh, min: mm } = getEtParts();
+      if ((hh * 100 + mm) >= 1550 && pct > 0) {
+        await closePosition(client, trade,
+          `EOD lock — Market closing soon, securing +${pct}% · $${curPremium.toFixed(2)}`, webull);
+        continue;
+      }
+
+      // 3. Momentum turned AGAINST position — exit to protect capital
       if (momentum === "AGAINST") {
         const againstMsg = trade.direction === "CALL"
           ? "RSI/price turning bearish on 5m chart"
@@ -1144,22 +1233,21 @@ async function monitor2Min(client, webull) {
         continue;
       }
 
-      // 3. Option expired
+      // 4. Option expired
       if (T <= 0) {
         await closePosition(client, trade, "Option expired", webull);
         continue;
       }
 
-      // 4. Theta decay exit: DTE ≤ 2 past 3:15 PM
+      // 5. Theta decay exit: DTE ≤ 2 past 3:15 PM
       const dte = T * 365;
-      const { hour: hh, min: mm } = getEtParts();
       if (dte <= 2 && (hh * 100 + mm) >= 1515) {
         await closePosition(client, trade,
           `Theta exit — ${dte.toFixed(1)} DTE, cutting before overnight decay · $${curPremium.toFixed(2)}`, webull);
         continue;
       }
 
-      // 5. Strong profit + momentum neutral/fading → take profit
+      // 6. Strong profit + momentum neutral/fading → take profit
       if (pct >= 50 && momentum !== "WITH") {
         await closePosition(client, trade,
           `Profit secured — +${pct}% with fading momentum · $${curPremium.toFixed(2)}`, webull);
