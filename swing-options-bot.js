@@ -408,39 +408,40 @@ function calcRecentWinRate(tradeHistory = null) {
 
 function scaleBudgetByWinRate(baseBudget) {
   const winRate = calcRecentWinRate();
-  // Scale: 0% WR → 50% budget, 50% WR → 100%, 100% WR → 150%
-  const scale = 0.5 + winRate;
+  // Scale: 0% WR → 50% budget, 50% WR → 100%, 100% WR → 120% (capped to avoid over-leverage)
+  const scale = Math.min(0.5 + winRate, 1.2);
   return Math.round(baseBudget * scale * 100) / 100;
 }
 
 // ── IV PERCENTILE RANK (#4) ──────────────────────────────────────────────
 
 function calcHistVolPercentile(bars) {
-  if (!bars || bars.length < 252) return 0.5; // insufficient data, neutral
+  if (!bars || bars.length < 30) return 0.5; // insufficient data, neutral
   const closes = bars.map(b => b.close);
   const allVols = [];
 
-  // Calculate rolling 20-day volatility (approx daily vol)
-  for (let i = 20; i < Math.min(closes.length, 252); i++) {
+  // Calculate rolling 20-day volatility across history
+  const maxLookback = Math.min(closes.length, 252);
+  for (let i = 20; i < maxLookback; i++) {
     const vol = calcVolatility(closes.slice(i - 20, i));
     if (vol > 0) allVols.push(vol);
   }
 
-  if (allVols.length === 0) return 0.5;
+  if (allVols.length < 5) return 0.5; // too little history
 
-  const currentVol = calcVolatility(closes.slice(-20));
+  const currentVol = calcVolatility(closes.slice(-Math.min(20, closes.length)));
   allVols.sort((a, b) => a - b);
 
-  // Find rank: how many vols are below current?
+  // Find rank: what percentile is current vol
   const rank = allVols.filter(v => v <= currentVol).length / allVols.length;
-  return rank;
+  return Math.max(0, Math.min(1, rank)); // clamp to [0,1]
 }
 
 function isValidIVRank(bars) {
   const rank = calcHistVolPercentile(bars);
-  // Only trade extremes: < 20th %ile (quiet, skip) or > 80th %ile (volatile, favor)
-  if (rank < 0.2 || rank > 0.8) return true;
-  return false; // mid-range IV, skip to avoid noise
+  // Only trade when IV is HIGH (> 80th percentile). Skip low/mid-range
+  if (rank > 0.8) return true;
+  return false;
 }
 
 function calcMACD(closes) {
@@ -687,7 +688,7 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
  * Picks the ask price, finds the most contracts within budget, filters by OI > 0.
  */
 function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_BUDGET, spotPrice = null) {
-  // #2: Greeks filter — prefer delta 0.5–0.7 (ATM-ish, high probability)
+  // #2: Greeks filter — prefer delta 0.4–0.8 (ATM-ish, higher probability, moderate theta)
   const filtered = chain
     .filter(c => {
       if (c.optionType !== direction || c.openInterest <= 0 || c.ask <= 0) return false;
@@ -696,7 +697,7 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
         const T = daysUntil(expiryDate) / 365;
         const sigma = 0.25; // rough estimate
         const delta = Math.abs(calcDelta(spotPrice, c.strikePrice, T, sigma, direction));
-        if (delta < 0.4 || delta > 0.8) return false; // prefer 0.4–0.8 (tighter than old 0.5–0.7)
+        if (delta < 0.4 || delta > 0.8) return false; // ATM-ish range
       }
       return true;
     })
@@ -1215,11 +1216,11 @@ async function monitor2Min(client, webull) {
         continue;
       }
 
-      // 2. Time-based EOD exit (#1) — lock wins by 3:50 PM
+      // 2. Time-based EOD exit (#1) — lock wins by 3:20 PM (before 3:30 auto-close)
       const { hour: hh, min: mm } = getEtParts();
-      if ((hh * 100 + mm) >= 1550 && pct > 0) {
+      if ((hh * 100 + mm) >= 1520 && pct > 0) {
         await closePosition(client, trade,
-          `EOD lock — Market closing soon, securing +${pct}% · $${curPremium.toFixed(2)}`, webull);
+          `EOD lock — Market closing in 10 min, securing +${pct}% · $${curPremium.toFixed(2)}`, webull);
         continue;
       }
 
