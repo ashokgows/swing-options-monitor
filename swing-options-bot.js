@@ -27,9 +27,10 @@ const TZ         = "America/New_York";
 const STATE_FILE = path.join(process.cwd(), ".swing-options-state.json");
 const PERF_FILE  = path.join(process.cwd(), ".swing-options-performance.json");
 
-const MIN_BUDGET          = 100;   // hard floor — never trade with less than $100
+const MIN_BUDGET          = 10;    // absolute floor — won't trade with less than $10
+const FALLBACK_BUDGET     = parseFloat(process.env.MAX_TRADE_BUDGET || "76"); // used when balance API is unavailable
 const ABSOLUTE_MAX_BUDGET = parseInt(process.env.ABSOLUTE_MAX_BUDGET || "2000", 10);
-const BUYING_POWER_RATIO  = 0.50;  // use 50% of buying power per trade
+const BUYING_POWER_RATIO  = 0.95;  // use 95% of balance when small (<$300), 50% otherwise
 const CHANNEL_ID          = process.env.DISCORD_CHANNEL_ID;
 const APPROVAL_TIMEOUT    = 10 * 60 * 1000;
 
@@ -181,23 +182,27 @@ function isDailyLossExceeded() {
 
 // ── DYNAMIC BUDGET ─────────────────────────────────────────────────────────
 
-// Calculates trade budget: 50% of option buying power, clamped to [$100, ABSOLUTE_MAX_BUDGET].
-// Falls back to $100 if Webull balance call fails.
+// Calculates trade budget dynamically from account balance.
+// • balance < $300  → use 95% of balance (small account, deploy most of it)
+// • balance ≥ $300  → use 50% of balance (larger account, preserve capital)
+// Falls back to MAX_TRADE_BUDGET env var (default $76) when balance API is unavailable.
 async function calcTradeBudget(webull) {
   try {
     const bal = await webull.getBalance();
-    // Webull may expose buyingPower, optionBuyingPower, or cash
-    const bp = parseFloat(
+    const bp  = parseFloat(
       bal?.optionBuyingPower || bal?.buyingPower || bal?.cash || 0
     );
-    if (bp > 10) {
-      const dynamic = Math.round(bp * BUYING_POWER_RATIO);
-      return Math.max(MIN_BUDGET, Math.min(dynamic, ABSOLUTE_MAX_BUDGET));
+    if (bp > MIN_BUDGET) {
+      const ratio   = bp < 300 ? 0.95 : 0.50;
+      const dynamic = Math.round(bp * ratio);
+      const budget  = Math.min(Math.max(dynamic, MIN_BUDGET), ABSOLUTE_MAX_BUDGET);
+      console.log(`[${etFull()}] Balance: $${bp.toFixed(2)} → budget $${budget} (${Math.round(ratio * 100)}% of balance)`);
+      return budget;
     }
   } catch (e) {
-    console.warn(`[${etFull()}] Balance fetch failed — using $${MIN_BUDGET} default: ${e.message}`);
+    console.warn(`[${etFull()}] Balance fetch failed — using $${FALLBACK_BUDGET} fallback: ${e.message}`);
   }
-  return MIN_BUDGET;
+  return FALLBACK_BUDGET;
 }
 
 // ── VIX REGIME ─────────────────────────────────────────────────────────────
@@ -463,7 +468,7 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
     const premium        = blackScholes(spot, strike, T, sigma, direction);
     const costPerContract = premium * 100; // 1 contract = 100 shares
 
-    if (costPerContract < 5)        continue; // too cheap → illiquid/junk
+    if (costPerContract < 1)        continue; // too cheap → illiquid/junk
     if (costPerContract > budget)   continue; // exceeds trade budget
 
     const contracts = Math.floor(budget / costPerContract);
@@ -683,7 +688,7 @@ async function runScan(client, webull, force = false) {
   // ── 4. Send trade proposal with Discord buttons ───────────────────────────
   const dirEmoji  = best.direction === "CALL" ? "📈" : "📉";
   const runners   = setups.slice(1, 4).map(s => `${s.symbol} ${s.direction} (${s.score})`).join(", ");
-  const budgetSrc = budget > MIN_BUDGET ? `50% buying power` : `default`;
+  const budgetSrc = budget === FALLBACK_BUDGET ? `fallback (balance API unavailable)` : budget < 300 ? `95% of $${Math.round(budget / 0.95)} balance` : `50% of balance`;
 
   const proposalText =
     `${dirEmoji} **TRADE SETUP** — ${etFull()}\n` +
