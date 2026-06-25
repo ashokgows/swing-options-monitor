@@ -1,6 +1,6 @@
 {
   "name": "swing-options-monitor",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Swing options trading bot — Discord-driven, dynamic budget (50% buying power), CALL/PUT only",
   "main": "swing-options-bot.js",
   "type": "commonjs",
