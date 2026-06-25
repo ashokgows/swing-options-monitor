@@ -370,6 +370,67 @@ function getMarketTrend(spyBars) {
   return "NEUTRAL";
 }
 
+// ── MACD (12/26/9 standard) ────────────────────────────────────────────────
+
+function calcEMA(closes, period) {
+  if (closes.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = closes.slice(0, period).reduce((a, b) => a + b) / period;
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function calcMACD(closes) {
+  if (closes.length < 35) return null;
+  const ema12     = calcEMA(closes, 12);
+  const ema26     = calcEMA(closes, 26);
+  const prevEma12 = calcEMA(closes.slice(0, -1), 12);
+  const prevEma26 = calcEMA(closes.slice(0, -1), 26);
+  if (!ema12 || !ema26 || !prevEma12 || !prevEma26) return null;
+
+  const macdLine     = ema12 - ema26;
+  const prevMacdLine = prevEma12 - prevEma26;
+  // Signal line approximation using 9-period EMA of MACD
+  const macdHistory = [];
+  for (let i = 26; i <= closes.length; i++) {
+    const e12 = calcEMA(closes.slice(0, i), 12);
+    const e26 = calcEMA(closes.slice(0, i), 26);
+    if (e12 && e26) macdHistory.push(e12 - e26);
+  }
+  const signalLine = macdHistory.length >= 9 ? calcEMA(macdHistory, 9) : 0;
+  const histogram  = macdLine - signalLine;
+
+  return {
+    macdLine,
+    signalLine,
+    histogram,
+    crossUp:   prevMacdLine <= signalLine && macdLine > signalLine,
+    crossDown: prevMacdLine >= signalLine && macdLine < signalLine,
+  };
+}
+
+// ── SECTOR ETF MAP ─────────────────────────────────────────────────────────
+
+const SECTOR_ETF_MAP = {
+  XLK: ["NVDA","AAPL","MSFT","AVGO","AMD","INTC","QCOM","AMAT","LRCX","MU","ARM","DELL","ORCL","CRM","ADBE","NOW","INTU","SNOW","PANW","CRWD"],
+  XLF: ["JPM","BAC","GS","MS","WFC","C","BLK","SCHW","AXP","V","MA","PYPL","COIN","HOOD","SPGI","CME"],
+  XLY: ["WMT","COST","HD","LOW","MCD","SBUX","NKE","TGT","SHOP","MELI","BKNG","ABNB","UBER","LYFT","DASH","AMZN"],
+  XLV: ["UNH","LLY","ABBV","PFE","MRK","AMGN","ABT","TMO","DHR","ISRG","MDT","BSX","CVS"],
+  XLI: ["GE","CAT","DE","RTX","BA","ADP","MMM"],
+  XLE: ["XOM","CVX"],
+  XLC: ["NFLX","DIS","T","VZ","SNAP","PINS","RBLX","ZM","META","GOOGL"],
+};
+
+// Build reverse map: symbol → { etf }
+const SYMBOL_SECTOR_MAP = {};
+for (const [etf, symbols] of Object.entries(SECTOR_ETF_MAP)) {
+  for (const sym of symbols) {
+    SYMBOL_SECTOR_MAP[sym] = { etf, _trend: "NEUTRAL" };
+  }
+}
+
 /**
  * Score a stock for an options setup.
  * @param {string} symbol
@@ -436,6 +497,36 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
   }
 
   if (score < 15) return null; // discard if trend kills the signal
+
+  // ── MACD confirmation (#4) ──────────────────────────────────────────────
+  const macd = calcMACD(closes);
+  if (macd) {
+    if (direction === "CALL" && macd.histogram > 0 && macd.crossUp) {
+      score += 12; reasons.push("MACD bullish crossover confirmed");
+    } else if (direction === "PUT" && macd.histogram < 0 && macd.crossDown) {
+      score += 12; reasons.push("MACD bearish crossover confirmed");
+    } else if (direction === "CALL" && macd.histogram > 0) {
+      score += 5;  reasons.push("MACD positive");
+    } else if (direction === "PUT" && macd.histogram < 0) {
+      score += 5;  reasons.push("MACD negative");
+    } else {
+      score -= 5;  reasons.push("MACD diverging from signal");
+    }
+  }
+
+  // ── Sector ETF alignment (#6) ──────────────────────────────────────────
+  const sector = SYMBOL_SECTOR_MAP[symbol];
+  if (sector) {
+    if (direction === "CALL" && sector._trend === "BULLISH") {
+      score += 8; reasons.push(`Sector ${sector.etf} aligned (bullish)`);
+    } else if (direction === "PUT" && sector._trend === "BEARISH") {
+      score += 8; reasons.push(`Sector ${sector.etf} aligned (bearish)`);
+    } else if (direction === "CALL" && sector._trend === "BEARISH") {
+      score -= 6; reasons.push(`Sector ${sector.etf} against (bearish)`);
+    } else if (direction === "PUT" && sector._trend === "BULLISH") {
+      score -= 6; reasons.push(`Sector ${sector.etf} against (bullish)`);
+    }
+  }
 
   // ── Volume confirmation bonus ─────────────────────────────────────────────
   const avgVol = volumes.slice(-10).reduce((a, b) => a + b) / 10;
@@ -654,17 +745,32 @@ async function runScan(client, webull, force = false) {
     return;
   }
 
-  // ── 2. Scan symbols in parallel batches of 10 ────────────────────────────
+  // ── 2a. Fetch sector ETF trends in parallel (#6) ─────────────────────────
+  const sectorETFs = [...new Set(Object.keys(SECTOR_ETF_MAP))];
+  const sectorResults = await Promise.allSettled(
+    sectorETFs.map(etf => webull.getBars(etf, "1d", 25))
+  );
+  sectorETFs.forEach((etf, i) => {
+    if (sectorResults[i].status === "fulfilled") {
+      const trend = getMarketTrend(sectorResults[i].value);
+      for (const sym of SECTOR_ETF_MAP[etf]) {
+        if (SYMBOL_SECTOR_MAP[sym]) SYMBOL_SECTOR_MAP[sym]._trend = trend;
+      }
+    }
+  });
+
+  // ── 2b. Scan symbols in parallel batches of 10 ──────────────────────────
   const setups         = [];
   let   earningsSkipped = 0;
   const BATCH_SIZE     = 10;
+  const MIN_SCORE      = 45; // #1: only high-conviction setups
 
   for (let i = 0; i < scanList.length; i += BATCH_SIZE) {
     const batch = scanList.slice(i, i + BATCH_SIZE);
     const results = await Promise.allSettled(
       batch.map(async (symbol) => {
         if (earningsSet.has(symbol)) return { _earningsSkip: true };
-        const bars = await webull.getBars(symbol, "1d", 30);
+        const bars = await webull.getBars(symbol, "1d", 35);
         if (!bars || bars.length < 22) return null;
         return scoreSetup(symbol, bars, marketTrend);
       })
@@ -672,6 +778,7 @@ async function runScan(client, webull, force = false) {
     for (const r of results) {
       if (r.status !== "fulfilled" || !r.value) continue;
       if (r.value._earningsSkip) { earningsSkipped++; continue; }
+      if (r.value.score < MIN_SCORE) continue; // #1: skip low-conviction
       setups.push(r.value);
     }
   }
@@ -687,10 +794,56 @@ async function runScan(client, webull, force = false) {
     return;
   }
 
-  // ── 3. Pick best setup + real option chain pricing ───────────────────────
+  // ── 3. Pick best setup + 5m confirmation (#3) ───────────────────────────
   setups.sort((a, b) => b.score - a.score);
-  const best   = setups[0];
-  const expiry = optimalExpiry(); // 7-14 days out to avoid excessive theta decay
+
+  // Multi-timeframe confirmation: check 5m bars for intraday trend alignment
+  let best = null;
+  for (const setup of setups) {
+    try {
+      const bars5m = await webull.getBars(setup.symbol, "5m", 20);
+      if (bars5m && bars5m.length >= 10) {
+        const closes5m = bars5m.map(b => b.close);
+        const rsi5m    = calcRSI(closes5m, 10);
+        const ok = (setup.direction === "CALL" && rsi5m > 45) ||
+                   (setup.direction === "PUT"  && rsi5m < 55);
+        if (ok) {
+          setup.reasons.push(`5m RSI ${rsi5m.toFixed(0)} confirms ${setup.direction}`);
+          setup.score += 5;
+          best = setup;
+          break;
+        } else {
+          console.log(`[${etFull()}] ${setup.symbol} skipped — 5m RSI ${rsi5m.toFixed(0)} not confirming ${setup.direction}`);
+        }
+      } else {
+        best = setup; // can't confirm, take the daily signal
+        break;
+      }
+    } catch {
+      best = setup; // 5m fetch failed, take daily signal
+      break;
+    }
+  }
+
+  if (!best) {
+    await sendMsg(client,
+      `🔍 **SCAN COMPLETE** — ${setups.length} setup(s) rejected by 5m confirmation _(${etFull()})_\n` +
+      earningsNote +
+      `VIX: ${vixInfo.emoji} ${vixInfo.label}`
+    );
+    return;
+  }
+
+  // ── 3b. Determine expiry: 0DTE for SPY/QQQ with small budgets (#5) ─────
+  const is0DTECandidate = ["SPY", "QQQ", "IWM"].includes(best.symbol) && budget < 150;
+  let expiry;
+  if (is0DTECandidate) {
+    // 0DTE: today's date
+    expiry = etDateStr();
+    best.reasons.push("0DTE — small account, intraday play");
+  } else {
+    expiry = optimalExpiry();
+  }
 
   // Attempt to get real bid/ask from Webull option chain; fall back to Black-Scholes
   let chainData = null;
