@@ -19,10 +19,11 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Set up gcloud
+      - name: Set up gcloud (Node.js 24 compatible)
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ secrets.GCP_VM_PROJECT }}
+          install_components: 'gke-gcloud-auth-plugin'
 
       - name: Write SSH private key
         run: |
@@ -32,7 +33,9 @@ jobs:
 
       - name: Open IAP TCP tunnel and deploy
         run: |
-          # Start IAP TCP tunnel: routes localhost:2222 → VM:22 via Google's IAP
+          set -e
+
+          echo "Starting IAP TCP tunnel..."
           gcloud compute start-iap-tunnel \
             ${{ secrets.GCP_VM_NAME }} 22 \
             --local-host-port=localhost:2222 \
@@ -40,16 +43,17 @@ jobs:
             --project=${{ secrets.GCP_VM_PROJECT }} &
           IAP_PID=$!
 
-          # Give tunnel a moment to establish
-          sleep 6
+          echo "Waiting for tunnel to establish..."
+          sleep 8
 
-          # Deploy over the tunnel
+          echo "Testing SSH connection..."
           ssh \
             -i ~/.ssh/deploy_key \
             -p 2222 \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=30 \
+            -vvv \
             ${{ secrets.GCP_VM_USER }}@localhost "
               set -e
               cd ~/swing-options-monitor
@@ -63,7 +67,10 @@ jobs:
               pm2 save
               echo '── Status ──'
               pm2 list
-              echo '✅ Deploy done at \$(date)'
+              echo '✅ Deploy done at '
+              date
             "
 
+          RESULT=$?
           kill $IAP_PID 2>/dev/null || true
+          exit $RESULT
