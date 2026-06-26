@@ -1015,6 +1015,7 @@ async function runScan(client, webull, force = false) {
 
 async function placeTradeOrder(client, webull, approval) {
   const { symbol, direction, position } = approval;
+  const PAPER_TRADE = process.env.PAPER_TRADE === "true";
 
   // Guard: reject if a trade was already opened since approval was sent
   const currentState = loadState();
@@ -1023,19 +1024,29 @@ async function placeTradeOrder(client, webull, approval) {
     return;
   }
 
-  console.log(`[${etFull()}] Placing ${direction} order: ${symbol} $${position.strike} exp ${position.expiryDate}`);
+  const modeLabel = PAPER_TRADE ? "📋 PAPER TRADE (SIMULATED)" : "💰 LIVE TRADE";
+  console.log(`[${etFull()}] ${modeLabel}: Placing ${direction} order: ${symbol} $${position.strike} exp ${position.expiryDate}`);
 
   try {
-    const order = await webull.placeOptionOrder({
-      symbol,
-      quantity:   position.contracts,
-      side:       "BUY",
-      optionType: direction,
-      strike:     position.strike,
-      expiryDate: position.expiryDate,
-      limitPrice: position.premium,
-      timeInForce: "DAY",
-    });
+    let order = null;
+
+    // ── LIVE TRADE: Place actual order on Webull ──────────────────────────────
+    if (!PAPER_TRADE) {
+      order = await webull.placeOptionOrder({
+        symbol,
+        quantity:   position.contracts,
+        side:       "BUY",
+        optionType: direction,
+        strike:     position.strike,
+        expiryDate: position.expiryDate,
+        limitPrice: position.premium,
+        timeInForce: "DAY",
+      });
+    } else {
+      // ── PAPER TRADE: Simulate order (no real execution) ──────────────────────
+      console.log(`[${etFull()}] PAPER TRADE: Simulating order execution (no real money)`);
+      order = { orderId: `PAPER_${Date.now()}` };
+    }
 
     const trade = {
       id:             `trade_${Date.now()}`,
@@ -1050,6 +1061,7 @@ async function placeTradeOrder(client, webull, approval) {
       entryTime:      new Date().toISOString(),
       status:         "ACTIVE",
       activeSL:       position.sl,
+      isPaperTrade:   PAPER_TRADE,
     };
 
     const state          = loadState();
@@ -1058,20 +1070,22 @@ async function placeTradeOrder(client, webull, approval) {
     saveState(state);
 
     const dirEmoji = direction === "CALL" ? "📈" : "📉";
+    const paperLabel = PAPER_TRADE ? "📋 **[PAPER TRADE]** " : "✅ ";
     await sendMsg(client,
-      `✅ **ORDER PLACED** ${dirEmoji}\n\n` +
+      `${paperLabel}**ORDER PLACED** ${dirEmoji}\n\n` +
       `**${symbol} ${direction}** @ $${position.premium.toFixed(2)}/contract\n` +
       `• Contracts: ${position.contracts} · Cost: $${position.totalCost.toFixed(2)}\n` +
       `• Strike: $${position.strike.toFixed(2)} · Expiry: ${position.expiryDate}\n` +
-      `• Order ID: \`${trade.orderId}\`\n\n` +
-      `🎯 **Exit Strategy (dynamic):**\n` +
+      `• Order ID: \`${trade.orderId}\`\n` +
+      (PAPER_TRADE ? `• Mode: **PAPER TRADE (Simulated, no real money)**\n` : "") +
+      `\n🎯 **Exit Strategy (dynamic):**\n` +
       `• Initial SL: $${position.sl.toFixed(2)} (−20%)\n` +
       `• Profit floor: activates at +15%, trails 12% below peak\n` +
       `• Momentum exit: closes if intraday trend turns against position\n\n` +
       `_Monitoring every 2 min · ${etFull()}_`
     );
 
-    console.log(`[${etFull()}] Order placed for ${symbol} ${direction} — ID: ${trade.orderId}`);
+    console.log(`[${etFull()}] ${modeLabel} placed for ${symbol} ${direction} — ID: ${trade.orderId}`);
   } catch (err) {
     console.error(`[${etFull()}] Order failed: ${err.message}`);
     const state          = loadState();
@@ -1697,12 +1711,17 @@ async function main() {
   });
 
   client.once("clientReady", async () => {
+    const PAPER_TRADE = process.env.PAPER_TRADE === "true";
+    const modeLabel = PAPER_TRADE ? "📋 **PAPER TRADE MODE**" : "💰 **LIVE TRADING MODE**";
+    const modeWarning = PAPER_TRADE ? "⚠️ ALL TRADES ARE SIMULATED (NO REAL MONEY EXCHANGED)" : "⚠️ OPTIONS TRADING ONLY (CALL/PUT) — REAL MONEY";
+
     console.log(`[${etFull()}] Discord bot ready: ${client.user.tag}`);
     startScheduler(client, webull);
 
     await sendMsg(client,
-      `🤖 **Swing Options Bot v2.3** — ${etFull()}\n` +
-      `⚠️ OPTIONS TRADING ONLY (CALL/PUT) · **LIVE MODE**\n\n` +
+      `🤖 **Swing Options Bot v2.5** — ${etFull()}\n` +
+      `${modeWarning}\n` +
+      `${modeLabel}\n\n` +
       `📋 **Config:** Dynamic budget (scales with balance) · ${ELIGIBLE_SYMBOLS.length} symbols\n` +
       `• SL −20% · Profit floor at +15%, trails 12% below peak\n` +
       `• Momentum exit: closes when 5m trend turns against position\n` +
