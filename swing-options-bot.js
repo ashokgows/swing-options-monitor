@@ -72,40 +72,83 @@ function setCachedADX(symbol, adx, barTime) {
 
 // Top 100 S&P 500 components (by market cap) + major sector/index ETFs
 const ELIGIBLE_SYMBOLS = [
-  // ── Mega-cap tech ───────────────────────────────────────────────────────
-  "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AVGO",
-  "AMD",  "INTC", "QCOM", "AMAT", "LRCX",  "MU",   "ARM",  "DELL",
-  "ORCL", "CRM",  "ADBE", "NOW",  "INTU",  "SNOW", "PANW", "CRWD",
-  // ── Financials ──────────────────────────────────────────────────────────
-  "JPM",  "BAC",  "GS",   "MS",   "WFC",   "C",    "BLK",  "SCHW",
-  "AXP",  "V",    "MA",   "PYPL", "COIN",  "HOOD", "SPGI", "CME",
-  // ── Consumer & Retail ───────────────────────────────────────────────────
-  "WMT",  "COST", "HD",   "LOW",  "MCD",   "SBUX", "NKE",  "TGT",
-  "AMZN", "SHOP", "MELI", "BKNG", "ABNB",  "UBER", "LYFT", "DASH",
-  // ── Healthcare & Pharma ─────────────────────────────────────────────────
-  "UNH",  "LLY",  "ABBV", "PFE",  "MRK",   "AMGN", "ABT",  "TMO",
-  "DHR",  "ISRG", "MDT",  "BSX",  "CVS",
-  // ── Industrials ─────────────────────────────────────────────────────────
-  "GE",   "CAT",  "DE",   "RTX",  "BA",    "ADP",  "MMM",
-  // ── Energy ──────────────────────────────────────────────────────────────
-  "XOM",  "CVX",
-  // ── Communication & Media ───────────────────────────────────────────────
-  "NFLX", "DIS",  "T",    "VZ",   "SNAP",  "PINS", "RBLX", "ZM",
-  // ── Consumer Staples ────────────────────────────────────────────────────
-  "PG",   "KO",   "IBM",  "JNJ",  "PM",    "CSCO",
-  // ── Autos & EV ──────────────────────────────────────────────────────────
-  "F",    "GM",   "RIVN", "SOFI", "PLTR",  "MSTR",
-  // ── Growth & Speculative (liquid options) ────────────────────────────────
-  "APP",  "ROKU", "SQ",   "HOOD", "ACN",   "NEE",
-  // ── Index ETFs ──────────────────────────────────────────────────────────
-  "SPY",  "QQQ",  "IWM",  "DIA",
-  // ── Sector ETFs ─────────────────────────────────────────────────────────
-  "XLK",  "XLF",  "XLE",  "XLV",  "XLI",   "XLY",
-  // ── Leveraged ETFs (high-vol, great for options) ─────────────────────────
+  // ── MEGA-CAP TECH (30+) ──────────────────────────────────────────────────
+  "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD",
+  "INTC", "QCOM", "AMAT", "LRCX", "MU", "ARM", "DELL", "ORCL", "CRM",
+  "ADBE", "NOW", "INTU", "SNOW", "PANW", "CRWD", "NET", "PLTR", "ASML",
+  "ASML", "MSTR", "PYPL", "COIN", "HOOD", "SQ", "RBLX", "ZM",
+
+  // ── LARGE-CAP TECH (additional) ──────────────────────────────────────────
+  "ACN", "IBM", "CSCO", "ORCL", "INTU", "ENPH", "SEDG", "ON", "ONTO", "AMD",
+  "NXPI", "AVGO", "MRVL", "QRVO", "SWKS", "LSCC", "LDOS", "GIB", "SNPS", "CDNS",
+
+  // ── MEGA-CAP FINANCIALS (35+) ──────────────────────────────────────────
+  "JPM", "BAC", "GS", "MS", "WFC", "C", "BLK", "SCHW", "AXP", "V", "MA",
+  "COF", "LEN", "PGR", "PRU", "MET", "PFG", "AIG", "LEG", "NRG", "ALL",
+  "CME", "CBOE", "ICE", "NDAQ", "SPGI", "MCO", "SPY", "IVZ", "STT", "BRK",
+  "USB", "PNC", "KEY", "MI", "CFG", "FITB", "HBAN",
+
+  // ── LARGE-CAP HEALTHCARE (50+) ──────────────────────────────────────────
+  "UNH", "LLY", "JNJ", "MRK", "ABBV", "PFE", "AMGN", "ABT", "TMO", "DHR",
+  "ISRG", "MDT", "BSX", "CVS", "CL", "ELV", "VEEV", "DXCM", "PODD", "MASI",
+  "TMDX", "ALCO", "CI", "AET", "HUM", "UHS", "CPRT", "XRAY", "DLTR", "JBT",
+  "TEVA", "IDXX", "HST", "LPLA", "HCA", "OHI", "OKE", "EVR", "INVZ", "RGEN",
+  "PSTG", "VCYT", "NVRO", "EXAS", "OMCL", "CAR", "SEM", "NECA", "FGEN", "AKAM",
+
+  // ── LARGE-CAP INDUSTRIALS (40+) ──────────────────────────────────────────
+  "GE", "CAT", "DE", "RTX", "BA", "MMM", "ADP", "ITT", "CARR", "OTIS",
+  "AXON", "EFX", "RSG", "GWW", "AWK", "ARW", "CUZ", "ITW", "EPAC", "LRX",
+  "XPO", "KEX", "UFI", "PCAR", "FWDG", "STLD", "NUE", "CF", "ALB", "FCX",
+  "LAD", "GPC", "WSM", "TYL", "SLF", "NVDC", "BFAM", "BTU", "ENV", "FANG",
+
+  // ── CONSUMER DISCRETIONARY (50+) ────────────────────────────────────────
+  "WMT", "COST", "HD", "LOW", "MCD", "SBUX", "NKE", "TGT", "AMZN", "SHOP",
+  "MELI", "BKNG", "ABNB", "UBER", "LYFT", "DASH", "EXPE", "AKAM", "DECK",
+  "TJX", "BBY", "ROST", "DKL", "RH", "LVS", "MGM", "WYNN", "PENN", "GSAT",
+  "TPL", "KM", "WRK", "ATGE", "DCP", "CPRI", "SJM", "SCCO", "EGO", "MAN",
+  "DLTR", "DKNG", "GMAB", "TXRH", "GLDD", "HOLO", "WING", "AWK", "CALM", "BJ",
+
+  // ── ENERGY (25+) ───────────────────────────────────────────────────────
+  "XOM", "CVX", "COP", "MPC", "PSX", "VLO", "EOG", "SLB", "HAL", "OKE",
+  "MRO", "FANG", "PXD", "AR", "CNX", "SM", "MOD", "CIVI", "KKR", "RIG",
+  "SPY", "EQNR", "EQT", "DXPE", "ATMU",
+
+  // ── COMMUNICATIONS (20+) ────────────────────────────────────────────────
+  "NFLX", "DIS", "T", "VZ", "SNAP", "PINS", "TWTR", "CMCSA", "CHTR", "PARA",
+  "FOX", "FOXA", "WBD", "MTCH", "RDDT", "IAC", "MICT", "INSE", "LMND", "OTTY",
+
+  // ── CONSUMER STAPLES (25+) ──────────────────────────────────────────────
+  "PG", "KO", "JNJ", "MO", "PM", "UL", "CL", "KMB", "EL", "CPB", "CLX",
+  "GIS", "HSY", "MNST", "AGRO", "K", "NSP", "BGC", "USFD", "LW", "STZ", "TAP",
+  "HUBB", "CERS", "LILA", "LILAK",
+
+  // ── REAL ESTATE/REITs (20+) ─────────────────────────────────────────────
+  "AMT", "PLD", "CCI", "EQIX", "SPG", "VTR", "O", "LTC", "WELL", "EXR",
+  "PSA", "AVB", "EQR", "ARE", "BXP", "KIM", "REXR", "STAG", "SCHW", "VICI",
+
+  // ── UTILITIES (15+) ──────────────────────────────────────────────────────
+  "NEE", "DUK", "SO", "EXC", "AEP", "XEL", "DTE", "ED", "WEC", "ETR",
+  "PPL", "AES", "PEG", "FE", "NRG",
+
+  // ── MATERIALS (20+) ──────────────────────────────────────────────────────
+  "LIN", "SHW", "FCX", "NUE", "CF", "ALB", "DD", "APD", "ECL", "IFF",
+  "PPG", "CTVA", "WRK", "SCL", "AMRS", "SBAC", "STLD", "NEM", "GOLD", "OMC",
+
+  // ── TRANSPORTATION (10+) ─────────────────────────────────────────────────
+  "UAL", "DAL", "LUV", "AAL", "FDX", "UPS", "SAIA", "KEX", "ALK", "XPO",
+
+  // ── SEMICONDUCTORS (15+) ─────────────────────────────────────────────────
+  "NVIDIA", "AMD", "INTC", "QCOM", "AMAT", "LRCX", "ASML", "MU", "MRVL",
+  "NXPI", "AVGO", "QRVO", "SWKS", "ON", "SYNA",
+
+  // ── GROWTH & SPECULATION (20+) ───────────────────────────────────────────
+  "PLTR", "ROKU", "SOFI", "UPST", "NVTA", "RBLX", "GEVO", "CCIV", "LCID",
+  "RIVN", "NKLA", "CCSI", "NET", "CRWD", "PANW", "OKTA", "CHWY", "ZG", "Z",
+
+  // ── ETFs (12) ───────────────────────────────────────────────────────────
+  "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY",
   "TQQQ", "SQQQ",
-]
-// Deduplicate (AMZN appears twice above for grouping readability)
-.filter((s, i, arr) => arr.indexOf(s) === i);
+].filter((s, i, arr) => arr.indexOf(s) === i).sort();
 
 const MARKET_HOLIDAYS_2026 = [
   "01-01", "01-19", "02-16", "04-03", "05-25",
@@ -1410,7 +1453,7 @@ async function runScan(client, webull, force = false) {
   const setups         = [];
   let   earningsSkipped = 0;
   let   ivSkipped       = 0; // #4: IV filter
-  const BATCH_SIZE     = 10;
+  const BATCH_SIZE     = 25; // Increased for 300-symbol coverage (parallel execution handles it)
   const MIN_SCORE      = 55; // #1: only high-conviction setups (raised for higher quality)
 
   for (let i = 0; i < scanList.length; i += BATCH_SIZE) {
