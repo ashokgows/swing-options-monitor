@@ -477,6 +477,67 @@ function calcMACD(closes) {
   };
 }
 
+// #4: ADX (Average Directional Index) — measure trend strength
+function calcADX(highs, lows, closes, period = 14) {
+  if (!highs || !lows || !closes || highs.length < period * 2) return null;
+
+  // Calculate True Range
+  const tr = [];
+  for (let i = 1; i < closes.length; i++) {
+    const h = highs[i];
+    const l = lows[i];
+    const c = closes[i - 1];
+    const trv = Math.max(h - l, Math.abs(h - c), Math.abs(l - c));
+    tr.push(trv);
+  }
+
+  // Calculate +DM and -DM
+  const dmp = [];
+  const dmm = [];
+  for (let i = 1; i < highs.length; i++) {
+    const upMove = highs[i] - highs[i - 1];
+    const downMove = lows[i - 1] - lows[i];
+
+    let dp = 0, dm = 0;
+    if (upMove > 0 && upMove > downMove) dp = upMove;
+    if (downMove > 0 && downMove > upMove) dm = downMove;
+
+    dmp.push(dp);
+    dmm.push(dm);
+  }
+
+  // Calculate smoothed values
+  let sumTR = tr.slice(0, period).reduce((a, b) => a + b, 0);
+  let sumDP = dmp.slice(0, period).reduce((a, b) => a + b, 0);
+  let sumDM = dmm.slice(0, period).reduce((a, b) => a + b, 0);
+
+  let atrSmooth = sumTR;
+  let diPlus = (sumDP / sumTR) * 100;
+  let diMinus = (sumDM / sumTR) * 100;
+
+  // Calculate DX and ADX
+  const dx = [];
+  for (let i = period; i < tr.length; i++) {
+    atrSmooth = atrSmooth - atrSmooth / period + tr[i];
+    sumDP = sumDP - sumDP / period + dmp[i];
+    sumDM = sumDM - sumDM / period + dmm[i];
+
+    diPlus = (sumDP / atrSmooth) * 100;
+    diMinus = (sumDM / atrSmooth) * 100;
+    const di = Math.abs(diPlus - diMinus) / (diPlus + diMinus) * 100;
+    dx.push(di);
+  }
+
+  // ADX is smoothed DX
+  if (dx.length < period) return null;
+  let adx = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dx.length; i++) {
+    adx = (adx * (period - 1) + dx[i]) / period;
+  }
+
+  return Math.round(adx * 10) / 10;
+}
+
 // ── SECTOR ETF MAP ─────────────────────────────────────────────────────────
 
 const SECTOR_ETF_MAP = {
@@ -520,6 +581,18 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
 
   if (!bb || !atr || last <= 0) return null;
   if (vol < 0.008) return null; // too quiet for options
+
+  // #3: Volume confirmation — only trade high-volume stocks
+  const avgVol20 = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+  if (volumes[volumes.length - 1] < avgVol20 * 0.8) {
+    return null; // skip if today's volume < 80% of 20-day average
+  }
+
+  // #4: ADX trend strength — only trade strong trends (ADX > 25)
+  const adx = calcADX(highs, lows, closes);
+  if (!adx || adx < 25) {
+    return null; // skip if trend is weak
+  }
 
   let score     = 0;
   let direction = null;
@@ -693,8 +766,10 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
  *
  * Smart strike selection: If ATM is too expensive, finds next-closest strike within budget.
  * This preserves probability of profit while fitting within buying power.
+ *
+ * #2: Adaptive SL — uses ATR for stop loss instead of fixed -20%
  */
-function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_BUDGET, spotPrice = null) {
+function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_BUDGET, spotPrice = null, atr = null) {
   if (!chain || chain.length === 0) return null;
 
   // Filter base criteria (type, OI, price)
@@ -745,6 +820,14 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
       if (contracts < 1) continue;
 
       const totalCost = Math.round(contracts * costPerContract * 100) / 100;
+
+      // #2: Adaptive stop loss — use ATR if available, otherwise fixed -20%
+      let sl = premium * SL_MULT;
+      if (atr && spotPrice && spotPrice > 0) {
+        const atrFactor = 1.5 * atr / spotPrice;
+        sl = Math.max(premium * (1 - atrFactor), premium * 0.5); // floor at 50% of premium
+      }
+
       if (range.label !== "ATM (strict)") {
         console.log(`[${etFull()}] Strike selection: expanded to ${range.label} to fit budget`);
       }
@@ -754,7 +837,7 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
         premium:   Math.round(premium * 100) / 100,
         contracts,
         totalCost,
-        sl:        Math.round(premium * SL_MULT * 100) / 100,
+        sl:        Math.round(sl * 100) / 100,
       };
     }
   }
@@ -906,7 +989,7 @@ async function runScan(client, webull, force = false) {
   let   earningsSkipped = 0;
   let   ivSkipped       = 0; // #4: IV filter
   const BATCH_SIZE     = 10;
-  const MIN_SCORE      = 45; // #1: only high-conviction setups
+  const MIN_SCORE      = 55; // #1: only high-conviction setups (raised for higher quality)
 
   for (let i = 0; i < scanList.length; i += BATCH_SIZE) {
     const batch = scanList.slice(i, i + BATCH_SIZE);
@@ -1014,7 +1097,7 @@ async function runScan(client, webull, force = false) {
   }
 
   const position = chainData && chainData.length > 0
-    ? calcOptionPositionFromChain(chainData, best.direction, expiry, budget, best.last) // #2: pass spot for delta filter
+    ? calcOptionPositionFromChain(chainData, best.direction, expiry, budget, best.last, best.atr) // #2: pass spot & ATR for adaptive SL
     : calcOptionPosition(best.last, best.direction, best.vol, expiry, budget);
 
   if (!position) {
