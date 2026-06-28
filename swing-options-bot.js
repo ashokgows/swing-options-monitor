@@ -38,6 +38,19 @@ const SL_MULT              = 0.80;  // −20% initial stop loss
 const PROFIT_TRAIL_TRIGGER = 1.15;  // activate trailing floor when up 15%
 const PROFIT_TRAIL_PCT     = 0.88;  // trail floor at 88% of peak (12% pullback allowed)
 
+// ── MAGIC NUMBER CONFIG (easier to tune) ───────────────────────────────────
+const CONFIG = {
+  VOLATILITY_FLOOR:        0.008,  // min daily volatility to trade
+  IV_PERCENTILE_WINDOW:    0.80,   // min IV percentile rank
+  ZERO_DTE_BUDGET_THRESHOLD: 150,  // budget threshold for 0DTE trades
+  ADX_TREND_STRENGTH:      25,     // minimum ADX for strong trend
+  VOLUME_RATIO:            0.80,   // min volume as % of 20-day avg
+};
+
+// ── TRANSACTION LOCK (prevent race conditions) ────────────────────────────
+let isPlacingOrder = false;  // flag to prevent concurrent order placements
+const LOCK_TIMEOUT = 10000;  // 10 second timeout for lock
+
 // Top 100 S&P 500 components (by market cap) + major sector/index ETFs
 const ELIGIBLE_SYMBOLS = [
   // ── Mega-cap tech ───────────────────────────────────────────────────────
@@ -580,7 +593,7 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
   const vol   = calcVolatility(closes.slice(-10));
 
   if (!bb || !atr || last <= 0) return null;
-  if (vol < 0.008) return null; // too quiet for options
+  if (vol < CONFIG.VOLATILITY_FLOOR) return null; // too quiet for options
 
   // #3: Volume confirmation — only trade high-volume stocks
   const avgVol20 = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
@@ -1076,7 +1089,7 @@ async function runScan(client, webull, force = false) {
   }
 
   // ── 3b. Determine expiry: 0DTE for SPY/QQQ with small budgets (#5) ─────
-  const is0DTECandidate = ["SPY", "QQQ", "IWM"].includes(best.symbol) && budget < 150;
+  const is0DTECandidate = ["SPY", "QQQ", "IWM"].includes(best.symbol) && budget < CONFIG.ZERO_DTE_BUDGET_THRESHOLD;
   let expiry;
   if (is0DTECandidate) {
     // 0DTE: today's date
@@ -1159,9 +1172,22 @@ async function placeTradeOrder(client, webull, approval) {
   const { symbol, direction, position } = approval;
   const PAPER_TRADE = process.env.PAPER_TRADE === "true";
 
+  // ── TRANSACTION LOCK: Prevent concurrent order placements (#1, #2) ────────
+  if (isPlacingOrder) {
+    console.warn(`[${etFull()}] Order placement already in progress, rejecting duplicate request for ${symbol}`);
+    return;
+  }
+
+  isPlacingOrder = true;
+  const lockTimer = setTimeout(() => {
+    isPlacingOrder = false;
+    console.error(`[${etFull()}] CRITICAL: Order placement lock timeout after ${LOCK_TIMEOUT}ms`);
+  }, LOCK_TIMEOUT);
+
   // Guard: reject if a trade was already opened since approval was sent
   const currentState = loadState();
   if (currentState.activeTrades.length > 0) {
+    isPlacingOrder = false;
     await sendMsg(client, `⚠️ **Order blocked** — ${currentState.activeTrades.length} trade(s) already active. Only 1 position at a time.`);
     return;
   }
@@ -1234,6 +1260,10 @@ async function placeTradeOrder(client, webull, approval) {
     state.pendingApproval = null;
     saveState(state);
     await sendMsg(client, `❌ **ORDER FAILED** — ${err.message}\n\nTrade cancelled. Will scan next cycle.`);
+  } finally {
+    // Release transaction lock
+    clearTimeout(lockTimer);
+    isPlacingOrder = false;
   }
 }
 
