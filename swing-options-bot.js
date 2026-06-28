@@ -51,6 +51,25 @@ const CONFIG = {
 let isPlacingOrder = false;  // flag to prevent concurrent order placements
 const LOCK_TIMEOUT = 10000;  // 10 second timeout for lock
 
+// ── ADX CACHE (#4 - Performance optimization) ────────────────────────────
+// Avoid recalculating ADX (O(n²)) on every symbol scan
+// Format: { "SYMBOL": { adx: 25.5, timestamp: Date.now(), lastBarTime: "2026-06-27 14:30" } }
+const adxCache = {};
+const ADX_CACHE_TTL = 60000; // 1 minute TTL
+
+function getCachedADX(symbol, barTime) {
+  const cached = adxCache[symbol];
+  if (!cached) return null;
+  if (cached.lastBarTime === barTime && Date.now() - cached.timestamp < ADX_CACHE_TTL) {
+    return cached.adx;
+  }
+  return null;
+}
+
+function setCachedADX(symbol, adx, barTime) {
+  adxCache[symbol] = { adx, timestamp: Date.now(), lastBarTime: barTime };
+}
+
 // Top 100 S&P 500 components (by market cap) + major sector/index ETFs
 const ELIGIBLE_SYMBOLS = [
   // ── Mega-cap tech ───────────────────────────────────────────────────────
@@ -160,13 +179,18 @@ function daysUntil(dateStr) {
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
-  } catch {
+  } catch (err) {
+    console.warn(`[${etFull()}] State load error: ${err.message}, using defaults`);
     return { pendingApproval: null, activeTrades: [], closedTrades: [] };
   }
 }
 
 function saveState(s) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2) + "\n");
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2) + "\n");
+  } catch (err) {
+    console.error(`[${etFull()}] CRITICAL: State save failed: ${err.message}`);
+  }
 }
 
 function loadPerf() {
@@ -602,8 +626,14 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
   }
 
   // #4: ADX trend strength — only trade strong trends (ADX > 25)
-  const adx = calcADX(highs, lows, closes);
-  if (!adx || adx < 25) {
+  // Use cache to avoid O(n²) recalculation
+  const barTime = bars[bars.length - 1].time || new Date().toISOString();
+  let adx = getCachedADX(symbol, barTime);
+  if (adx === null) {
+    adx = calcADX(highs, lows, closes);
+    if (adx !== null) setCachedADX(symbol, adx, barTime);
+  }
+  if (!adx || adx < CONFIG.ADX_TREND_STRENGTH) {
     return null; // skip if trend is weak
   }
 
