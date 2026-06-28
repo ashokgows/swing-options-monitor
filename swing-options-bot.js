@@ -1402,9 +1402,27 @@ async function runScan(client, webull, force = false) {
   const budget = await calcTradeBudget(webull);
   console.log(`[${etFull()}] Trade budget: $${budget}`);
 
-  const scanList = ELIGIBLE_SYMBOLS.filter(s => s !== "SPY" && webull.isSymbolAllowed(s));
-  console.log(`[${etFull()}] Scanning ${scanList.length} symbols...`);
-  await sendMsg(client, `🔍 **SCANNING** ${scanList.length} symbols... _(${etFull()})_`);
+  // ── 0DTE ETF PRIORITY: Scan SPY, QQQ, IWM until 12:30 PM (highest theta decay) ──
+  const { hour, min } = getEtParts();
+  const timeNow = hour * 100 + min;
+  const is0DTEWindow = timeNow < 1230; // Scan 0DTE until 12:30 PM
+  const zeroDTESymbols = ["SPY", "QQQ", "IWM"];
+
+  let scanList = [];
+  if (is0DTEWindow) {
+    // Before 12:30: Prioritize 0DTE ETFs first, then other symbols
+    scanList = [
+      ...zeroDTESymbols.filter(s => webull.isSymbolAllowed(s)),
+      ...ELIGIBLE_SYMBOLS.filter(s => !zeroDTESymbols.includes(s) && webull.isSymbolAllowed(s))
+    ];
+    console.log(`[${etFull()}] 0DTE Window (until 12:30 PM): Scanning ${zeroDTESymbols.length} ETFs first + ${scanList.length - zeroDTESymbols.length} others`);
+  } else {
+    // After 12:30: Skip 0DTE, focus on regular symbols only
+    scanList = ELIGIBLE_SYMBOLS.filter(s => !zeroDTESymbols.includes(s) && webull.isSymbolAllowed(s));
+    console.log(`[${etFull()}] After 0DTE window (12:30+ PM): Scanning ${scanList.length} regular symbols (0DTE excluded)`);
+  }
+
+  await sendMsg(client, `🔍 **SCANNING** ${scanList.length} symbols${is0DTEWindow ? " (0DTE prioritized)" : " (0DTE excluded)"} _(${etFull()})_`);
 
   // ── 1. Parallel pre-scan: market trend (SPY) + VIX + earnings ────────────
   let marketTrend = "NEUTRAL";
