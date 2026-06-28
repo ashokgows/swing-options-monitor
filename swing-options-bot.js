@@ -1641,8 +1641,8 @@ function startScheduler(client, webull) {
       await monitor2Min(client, webull);
     }
 
-    // Every 15 min during market hours (skip 9:45) — rescan + status update
-    if (isMarketHours() && min % 15 === 0 && hhmm !== "0945" && !fired.has(`rescan_${today}_${hhmm}`)) {
+    // Every 15 min during market hours (skip 9:45, skip after 3:00 PM EOD window) — rescan + status update
+    if (isMarketHours() && min % 15 === 0 && hhmm !== "0945" && hhmm < "1500" && !fired.has(`rescan_${today}_${hhmm}`)) {
       fired.add(`rescan_${today}_${hhmm}`);
       await runScan(client, webull);
       await post15MinUpdate(client);
@@ -1657,6 +1657,13 @@ function startScheduler(client, webull) {
         for (const trade of [...s.activeTrades]) {
           await closePosition(client, trade, "Auto-close 3:30 PM ET", webull);
         }
+        // Confirm auto-close complete
+        const updated = loadState();
+        if (updated.activeTrades.length === 0) {
+          await sendMsg(client, `✅ **AUTO-CLOSE COMPLETE** — All positions closed. Daily report at 4:00 PM.`);
+        }
+      } else {
+        await sendMsg(client, `ℹ️ **3:30 PM Check** — No open positions to close.`);
       }
     }
 
