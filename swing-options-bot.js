@@ -1454,7 +1454,7 @@ async function runScan(client, webull, force = false) {
   let   earningsSkipped = 0;
   let   ivSkipped       = 0; // #4: IV filter
   const BATCH_SIZE     = 25; // Increased for 300-symbol coverage (parallel execution handles it)
-  const MIN_SCORE      = 55; // #1: only high-conviction setups (raised for higher quality)
+  const MIN_SCORE      = 80; // #1: EXCELLENT quality only (80+ = multiple confirmations strongly aligned)
 
   for (let i = 0; i < scanList.length; i += BATCH_SIZE) {
     const batch = scanList.slice(i, i + BATCH_SIZE);
