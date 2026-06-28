@@ -600,6 +600,134 @@ function calcStochRSI(closes, rsiPeriod = 5, stochPeriod = 14) {
   return ((lastRSI - minRSI) / (maxRSI - minRSI)) * 100;
 }
 
+// #5: VIX-BASED POSITION SIZING ADJUSTMENT ────────────────────────────────
+function getVixPositionAdjustment(vixLevel) {
+  if (vixLevel <= 12) {
+    return 0.7; // Low VIX: smaller position
+  } else if (vixLevel <= 18) {
+    return 1.0; // Normal VIX
+  } else if (vixLevel <= 25) {
+    return 1.1; // Elevated VIX
+  } else {
+    return 1.2; // High VIX
+  }
+}
+
+// #6: TIME-BASED POSITION SCALING (larger early in day) ────────────────────
+function getTimeOfDayPositionAdjustment() {
+  const { hour, min } = getEtParts();
+
+  // Early morning (9:45-10:30): Highest volatility, trade larger
+  if (hour === 9 && min >= 45 || hour === 10 && min < 30) return 1.2;
+
+  // Mid-morning (10:30-11:30): Still good, normal size
+  if (hour >= 10 && hour < 11 || hour === 11 && min < 30) return 1.0;
+
+  // Midday (11:30-1:30): Skip anyway, but if signal appears, reduce
+  if (hour >= 11 && hour < 13 || hour === 13 && min < 30) return 0.7;
+
+  // Afternoon (1:30-3:20): Good moves, normal size
+  if (hour >= 13 && hour < 15 || hour === 15 && min < 20) return 1.0;
+
+  return 0.8; // Outside hours, reduced
+}
+
+// #7: RECENT HIGH/LOW AVOIDANCE ──────────────────────────────────────────
+function isNearRecentExtreme(bars, lookback = 10) {
+  if (!bars || bars.length < lookback) return false;
+
+  const recent = bars.slice(-lookback);
+  const highs = recent.map(b => b.high);
+  const lows = recent.map(b => b.low);
+
+  const recentHigh = Math.max(...highs);
+  const recentLow = Math.min(...lows);
+  const current = bars[bars.length - 1].close;
+
+  // Don't trade if within 1% of recent high or low (reversal risk)
+  const nearHigh = current >= recentHigh * 0.99;
+  const nearLow = current <= recentLow * 1.01;
+
+  return nearHigh || nearLow;
+}
+
+// #8: TRADE FREQUENCY LIMITER ──────────────────────────────────────────────
+function getSymbolTradeCountToday(symbol, state) {
+  if (!state.closedTrades) return 0;
+
+  const today = etDateStr();
+  return state.closedTrades.filter(t =>
+    t.symbol === symbol && t.date === today
+  ).length;
+}
+
+function canTradeSymbolAgain(symbol, state, maxPerDay = 2) {
+  const count = getSymbolTradeCountToday(symbol, state);
+  return count < maxPerDay;
+}
+
+// #9: PROFIT TARGET OPTIMIZATION (varies by IV) ────────────────────────────
+function getOptimalProfitTarget(iv, direction = "CALL") {
+  // Low IV: Take smaller profits (1-2%)
+  if (iv < 0.15) return 1.01; // 1%
+
+  // Normal IV: Reasonable targets (2-4%)
+  if (iv < 0.30) return 1.03; // 3%
+
+  // High IV: Can aim for bigger moves (4-6%)
+  if (iv < 0.50) return 1.05; // 5%
+
+  // Very high IV: Maximum 6%
+  return 1.06;
+}
+
+// #10: VOLUME PROFILE CHECK ──────────────────────────────────────────────────
+function isHighVolumeZone(bars, lookback = 20) {
+  if (!bars || bars.length < lookback) return true; // default allow
+
+  const recent = bars.slice(-lookback);
+  const volumes = recent.map(b => b.volume || 0);
+  const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+  const lastVolume = bars[bars.length - 1].volume || 0;
+
+  // Trading where volume is above average = good liquidity
+  return lastVolume >= avgVolume * 0.8;
+}
+
+// #11: MOMENTUM DECAY DETECTOR ───────────────────────────────────────────────
+function hasMomentumDecayed(closes, rsiPeriod = 5, lookback = 3) {
+  if (closes.length < rsiPeriod + lookback) return false;
+
+  const rsiValues = [];
+  for (let i = rsiPeriod; i <= closes.length; i++) {
+    const rsi = calcRSI(closes.slice(0, i), rsiPeriod);
+    if (rsi !== null) rsiValues.push(rsi);
+  }
+
+  if (rsiValues.length < lookback) return false;
+
+  const recentRSI = rsiValues.slice(-lookback);
+  const trend = recentRSI[recentRSI.length - 1] - recentRSI[0];
+
+  // If RSI is declining fast, momentum is decaying
+  return trend < -10; // More than 10 point drop = decay
+}
+
+// #12: OVERNIGHT GAP CHECK ───────────────────────────────────────────────────
+function hasOvernightGap(bars, threshold = 0.02) {
+  if (bars.length < 2) return false;
+
+  const yesterday = bars[bars.length - 2];
+  const today = bars[bars.length - 1];
+
+  if (!yesterday || !today) return false;
+
+  const gap = Math.abs(today.open - yesterday.close) / yesterday.close;
+
+  // Gap > 2% = significant gap (might reverse)
+  return gap > threshold;
+}
+
 // #2: BOLLINGER BANDS SQUEEZE DETECTION ──────────────────────────────────
 function calcBollingerMetrics(closes, period = 20) {
   if (closes.length < period) return null;
@@ -679,40 +807,80 @@ for (const [etf, symbols] of Object.entries(SECTOR_ETF_MAP)) {
  * High win rate symbols → larger position (up to 1.5x)
  * Low win rate symbols → smaller position (down to 0.5x)
  */
-function getSymbolWinRateMultiplier(symbol, state) {
-  if (!state.symbolStats || !state.symbolStats[symbol]) return 1.0; // no history, use base
+function getSymbolWinRateMultiplier(symbol, direction, state) {
+  if (!state.symbolStats || !state.symbolStats[symbol]) return 1.0;
 
-  const stats = state.symbolStats[symbol];
-  const totalTrades = stats.wins + stats.losses;
+  // #1: Use direction-specific win rate (CALL vs PUT)
+  const dirWinRate = getDirectionWinRate(symbol, direction, state);
+  const dirKey = direction === "CALL" ? "calls" : "puts";
+  const dirStats = state.symbolStats[symbol][dirKey];
+  const dirTotal = dirStats.wins + dirStats.losses;
 
-  if (totalTrades < 3) return 1.0; // need at least 3 trades for reliable data
+  if (dirTotal < 2) return 1.0; // need at least 2 trades for direction
 
-  const symbolWinRate = stats.wins / totalTrades;
-
-  // Calculate overall win rate from closed trades
-  const allWins = Object.values(state.symbolStats || {}).reduce((s, v) => s + v.wins, 0);
-  const allLosses = Object.values(state.symbolStats || {}).reduce((s, v) => s + v.losses, 0);
+  // Calculate overall win rate
+  const allStats = Object.values(state.symbolStats || {});
+  const allWins = allStats.reduce((s, v) => s + v.calls.wins + v.puts.wins, 0);
+  const allLosses = allStats.reduce((s, v) => s + v.calls.losses + v.puts.losses, 0);
   const overallWinRate = (allWins + allLosses > 0) ? allWins / (allWins + allLosses) : 0.5;
 
-  // Scale position size: high win rate → 1.5x, low → 0.5x
-  const multiplier = 0.5 + (symbolWinRate / (overallWinRate || 0.5) * 0.5);
-  return Math.min(Math.max(multiplier, 0.5), 1.5); // cap between 0.5x and 1.5x
+  // #1: Scale based on direction-specific win rate
+  const multiplier = 0.5 + (dirWinRate / (overallWinRate || 0.5) * 0.5);
+
+  // Bonus: If direction win rate is significantly better, allow up to 1.5x
+  if (dirWinRate > 0.7 && overallWinRate > 0) {
+    return Math.min(Math.max(multiplier, 0.5), 1.5);
+  }
+
+  return Math.min(Math.max(multiplier, 0.5), 1.2); // cap between 0.5x and 1.2x if not strong
 }
 
 /**
  * Record trade result (win/loss) by symbol
  */
-function recordTradeResult(symbol, isWin, state) {
+function recordTradeResult(symbol, direction, isWin, state) {
   if (!state.symbolStats) state.symbolStats = {};
   if (!state.symbolStats[symbol]) {
-    state.symbolStats[symbol] = { wins: 0, losses: 0 };
+    state.symbolStats[symbol] = {
+      calls: { wins: 0, losses: 0 },
+      puts: { wins: 0, losses: 0 }
+    };
   }
 
+  const dirKey = direction === "CALL" ? "calls" : "puts";
   if (isWin) {
-    state.symbolStats[symbol].wins += 1;
+    state.symbolStats[symbol][dirKey].wins += 1;
   } else {
-    state.symbolStats[symbol].losses += 1;
+    state.symbolStats[symbol][dirKey].losses += 1;
   }
+}
+
+// Get direction-specific win rate for a symbol
+function getDirectionWinRate(symbol, direction, state) {
+  if (!state.symbolStats || !state.symbolStats[symbol]) return 0.5; // neutral if no data
+
+  const dirKey = direction === "CALL" ? "calls" : "puts";
+  const stats = state.symbolStats[symbol][dirKey];
+  const total = stats.wins + stats.losses;
+
+  if (total < 2) return 0.5; // need at least 2 trades
+
+  return stats.wins / total;
+}
+
+// ── #2: RISK/REWARD RATIO CALCULATOR ──────────────────────────────────────
+/**
+ * Calculate risk/reward ratio for a potential trade
+ * RR = (TP - Entry) / (Entry - SL)
+ * Only trade if RR >= 1.5x (or configurable threshold)
+ */
+function calcRiskRewardRatio(entryPrice, stopLoss, targetPrice) {
+  if (entryPrice <= stopLoss || targetPrice <= entryPrice) return 0;
+
+  const risk = entryPrice - stopLoss;
+  const reward = targetPrice - entryPrice;
+
+  return reward / risk; // e.g., 1.5x means 2:3 risk/reward
 }
 
 /**
@@ -722,12 +890,22 @@ function recordTradeResult(symbol, isWin, state) {
  * @param {string} marketTrend — "BULLISH" | "BEARISH" | "NEUTRAL"
  * Returns null if no qualifying setup.
  */
-function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
+function scoreSetup(symbol, bars, marketTrend = "NEUTRAL", state = null) {
   if (!bars || bars.length < 22) return null;
 
   const closes  = bars.map(b => b.close);
   const highs   = bars.map(b => b.high);
   const lows    = bars.map(b => b.low);
+
+  // ── PRE-FILTERS (quick exit if disqualified) ──────────────────────────────
+  // #7: Skip if near recent highs/lows (reversal risk)
+  if (isNearRecentExtreme(bars)) return null;
+
+  // #12: Skip if overnight gap (mean reversion risk)
+  if (hasOvernightGap(bars)) return null;
+
+  // #8: Skip if already traded this symbol today (limit frequency)
+  if (state && !canTradeSymbolAgain(symbol, state, 2)) return null;
   const volumes = bars.map(b => b.volume);
 
   const last  = closes[closes.length - 1];
@@ -1244,7 +1422,8 @@ async function runScan(client, webull, force = false) {
         if (!bars || bars.length < 22) return null;
         // #4: IV rank filter — only trade extremes
         if (!isValidIVRank(bars)) return { _ivSkip: true };
-        return scoreSetup(symbol, bars, marketTrend);
+        // #8: Pass state for trade frequency limiting
+        return scoreSetup(symbol, bars, marketTrend, state);
       })
     );
     for (const r of results) {
@@ -1340,12 +1519,19 @@ async function runScan(client, webull, force = false) {
     console.warn(`[${etFull()}] Option chain unavailable for ${best.symbol} (geo-blocked API): ${e.message} — using Black-Scholes estimate`);
   }
 
-  // ── #5: Win rate scaling by symbol — concentrate on winning symbols ──────
+  // ── #1/#5/#6: Multi-factor position sizing ────────────────────────────────
   const state = loadState();
-  const symbolMultiplier = getSymbolWinRateMultiplier(best.symbol, state);
-  const scaledBudget = Math.round(budget * symbolMultiplier);
-  if (symbolMultiplier !== 1.0) {
-    console.log(`[${etFull()}] Symbol ${best.symbol}: win rate multiplier ${symbolMultiplier.toFixed(2)}x → adjusted budget $${scaledBudget} (from $${budget})`);
+  const symbolMultiplier = getSymbolWinRateMultiplier(best.symbol, best.direction, state);
+  const vixAdjustment = vixLevel ? getVixPositionAdjustment(vixLevel) : 1.0;
+  const timeAdjustment = getTimeOfDayPositionAdjustment(); // #6
+
+  const scaledBudget = Math.round(budget * symbolMultiplier * vixAdjustment * timeAdjustment);
+  if (symbolMultiplier !== 1.0 || vixAdjustment !== 1.0 || timeAdjustment !== 1.0) {
+    const adjustLog = [];
+    if (symbolMultiplier !== 1.0) adjustLog.push(`WR ${symbolMultiplier.toFixed(2)}x`);
+    if (vixAdjustment !== 1.0) adjustLog.push(`VIX ${vixAdjustment.toFixed(2)}x`);
+    if (timeAdjustment !== 1.0) adjustLog.push(`Time ${timeAdjustment.toFixed(2)}x`);
+    console.log(`[${etFull()}] ${best.symbol} ${best.direction}: ${adjustLog.join(" + ")} → $${scaledBudget} (from $${budget})`);
   }
 
   const position = chainData && chainData.length > 0
@@ -1528,8 +1714,8 @@ async function closePosition(client, trade, reason, webull) {
   state.activeTrades  = state.activeTrades.filter(t => t.id !== trade.id);
   state.closedTrades.push({ ...trade, closedAt: new Date().toISOString(), reason, totalPnL, pct, exitPremium: trade.currentPremium });
 
-  // ── #5: Record win/loss by symbol for position sizing scaling ────────────
-  recordTradeResult(trade.symbol, isWin, state);
+  // ── #1/#5: Record win/loss by symbol + direction ───────────────────────
+  recordTradeResult(trade.symbol, trade.direction, isWin, state);
 
   saveState(state);
 
@@ -1615,11 +1801,33 @@ async function monitor2Min(client, webull) {
       // ── Update peak premium + profit floor (trailing) ─────────────────────
       if (curPremium > (trade.peakPremium || 0)) trade.peakPremium = curPremium;
 
+      // ── #3: AGGRESSIVE PROFIT LOCKING ──────────────────────────────────────
+      // Lock in profits faster: at +5%, +10%, then use regular profit floor
+      const profitPct = (curPremium - trade.entryPremium) / trade.entryPremium;
+
+      if (profitPct >= 0.10 && !trade.hasHardLock) {
+        // At +10% profit: trail at +5%
+        const hardLock = Math.round(trade.entryPremium * 1.05 * 100) / 100;
+        if (hardLock > trade.activeSL) {
+          trade.activeSL = hardLock;
+          trade.hasHardLock = true;
+          console.log(`[${etFull()}] Profit lock: At +10%, locked in +5% ($${hardLock.toFixed(2)})`);
+        }
+      } else if (profitPct >= 0.05 && !trade.breakEvenLock) {
+        // At +5% profit: move SL to breakeven
+        const beEven = trade.entryPremium;
+        if (beEven > trade.activeSL) {
+          trade.activeSL = beEven;
+          trade.breakEvenLock = true;
+          console.log(`[${etFull()}] Profit lock: At +5%, locked breakeven ($${beEven.toFixed(2)})`);
+        }
+      }
+
+      // Regular profit floor (after aggressive locking)
       if (curPremium >= trade.entryPremium * PROFIT_TRAIL_TRIGGER) {
         const floor = Math.round(trade.peakPremium * PROFIT_TRAIL_PCT * 100) / 100;
         if (!trade.profitFloor || floor > trade.profitFloor) {
           trade.profitFloor = floor;
-          // Raise the active SL to the profit floor
           if (floor > trade.activeSL) {
             trade.activeSL = floor;
             console.log(`[${etFull()}] Profit floor raised → $${floor.toFixed(2)} (peak $${trade.peakPremium.toFixed(2)})`);
