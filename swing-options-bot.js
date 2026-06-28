@@ -181,7 +181,12 @@ function loadState() {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
   } catch (err) {
     console.warn(`[${etFull()}] State load error: ${err.message}, using defaults`);
-    return { pendingApproval: null, activeTrades: [], closedTrades: [] };
+    return {
+      pendingApproval: null,
+      activeTrades: [],
+      closedTrades: [],
+      symbolStats: {} // #5: Track wins/losses per symbol for win rate scaling
+    };
   }
 }
 
@@ -575,6 +580,79 @@ function calcADX(highs, lows, closes, period = 14) {
   return Math.round(adx * 10) / 10;
 }
 
+// #4: STOCHASTIC RSI — RSI of RSI (confirmation for RSI extremes) ──────────
+function calcStochRSI(closes, rsiPeriod = 5, stochPeriod = 14) {
+  if (closes.length < rsiPeriod + stochPeriod) return null;
+
+  const rsiValues = [];
+  for (let i = rsiPeriod; i <= closes.length; i++) {
+    const rsi = calcRSI(closes.slice(0, i), rsiPeriod);
+    if (rsi !== null) rsiValues.push(rsi);
+  }
+
+  if (rsiValues.length < stochPeriod) return null;
+
+  const minRSI = Math.min(...rsiValues.slice(-stochPeriod));
+  const maxRSI = Math.max(...rsiValues.slice(-stochPeriod));
+  const lastRSI = rsiValues[rsiValues.length - 1];
+
+  if (maxRSI === minRSI) return 50; // avoid division by zero
+  return ((lastRSI - minRSI) / (maxRSI - minRSI)) * 100;
+}
+
+// #2: BOLLINGER BANDS SQUEEZE DETECTION ──────────────────────────────────
+function calcBollingerMetrics(closes, period = 20) {
+  if (closes.length < period) return null;
+
+  const recent = closes.slice(-period);
+  const sma = recent.reduce((a, b) => a + b, 0) / period;
+  const variance = recent.reduce((a, b) => a + Math.pow(b - sma, 2), 0) / period;
+  const stdDev = Math.sqrt(variance);
+
+  const upper = sma + (2 * stdDev);
+  const lower = sma - (2 * stdDev);
+  const bandwidth = (upper - lower) / sma; // width as % of price
+
+  const last = closes[closes.length - 1];
+  const isNearUpper = last >= upper * 0.99;
+  const isNearLower = last <= lower * 1.01;
+  const isSqueezed = bandwidth < 0.02; // < 2% bandwidth = squeeze
+
+  return {
+    upper,
+    lower,
+    sma,
+    bandwidth,
+    isNearUpper,
+    isNearLower,
+    isSqueezed,
+  };
+}
+
+// #3: SUPPORT/RESISTANCE LEVELS ──────────────────────────────────────────
+function calcSupportResistance(bars, lookback = 20) {
+  if (!bars || bars.length < lookback) return null;
+
+  const recent = bars.slice(-lookback);
+  const highs = recent.map(b => b.high);
+  const lows = recent.map(b => b.low);
+
+  const resistance = Math.max(...highs);
+  const support = Math.min(...lows);
+  const current = bars[bars.length - 1].close;
+
+  // Check if current price is near support or resistance
+  const nearSupport = current <= support * 1.02;
+  const nearResistance = current >= resistance * 0.98;
+
+  return {
+    support,
+    resistance,
+    nearSupport,
+    nearResistance,
+  };
+}
+
 // ── SECTOR ETF MAP ─────────────────────────────────────────────────────────
 
 const SECTOR_ETF_MAP = {
@@ -592,6 +670,48 @@ const SYMBOL_SECTOR_MAP = {};
 for (const [etf, symbols] of Object.entries(SECTOR_ETF_MAP)) {
   for (const sym of symbols) {
     SYMBOL_SECTOR_MAP[sym] = { etf, _trend: "NEUTRAL" };
+  }
+}
+
+// ── #5: WIN RATE SCALING BY SYMBOL ───────────────────────────────────────
+/**
+ * Get position size multiplier based on symbol's historical win rate
+ * High win rate symbols → larger position (up to 1.5x)
+ * Low win rate symbols → smaller position (down to 0.5x)
+ */
+function getSymbolWinRateMultiplier(symbol, state) {
+  if (!state.symbolStats || !state.symbolStats[symbol]) return 1.0; // no history, use base
+
+  const stats = state.symbolStats[symbol];
+  const totalTrades = stats.wins + stats.losses;
+
+  if (totalTrades < 3) return 1.0; // need at least 3 trades for reliable data
+
+  const symbolWinRate = stats.wins / totalTrades;
+
+  // Calculate overall win rate from closed trades
+  const allWins = Object.values(state.symbolStats || {}).reduce((s, v) => s + v.wins, 0);
+  const allLosses = Object.values(state.symbolStats || {}).reduce((s, v) => s + v.losses, 0);
+  const overallWinRate = (allWins + allLosses > 0) ? allWins / (allWins + allLosses) : 0.5;
+
+  // Scale position size: high win rate → 1.5x, low → 0.5x
+  const multiplier = 0.5 + (symbolWinRate / (overallWinRate || 0.5) * 0.5);
+  return Math.min(Math.max(multiplier, 0.5), 1.5); // cap between 0.5x and 1.5x
+}
+
+/**
+ * Record trade result (win/loss) by symbol
+ */
+function recordTradeResult(symbol, isWin, state) {
+  if (!state.symbolStats) state.symbolStats = {};
+  if (!state.symbolStats[symbol]) {
+    state.symbolStats[symbol] = { wins: 0, losses: 0 };
+  }
+
+  if (isWin) {
+    state.symbolStats[symbol].wins += 1;
+  } else {
+    state.symbolStats[symbol].losses += 1;
   }
 }
 
@@ -641,10 +761,18 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
   let direction = null;
   const reasons = [];
 
+  // ── #1: ENTRY CONFIRMATION CANDLE (improved entry timing) ────────────────
+  const prevRSI = closes.length >= 2 ? calcRSI(closes.slice(0, -1), 5) : null;
+
   // ── Bullish signals → CALL ──
   if (rsi < 30) {
     score += 35; direction = "CALL";
     reasons.push(`RSI ${rsi.toFixed(0)} — deeply oversold`);
+
+    // #1: Confirmation: RSI bounced ABOVE 30 (confirmation candle) ─────────
+    if (prevRSI !== null && prevRSI < 30 && rsi > 30 && rsi < 40) {
+      score += 10; reasons.push("Entry confirmation: RSI bounced off 30 (buy signal)");
+    }
   } else if (rsi < 40 && last <= bb.lower * 1.01) {
     score += 28; direction = "CALL";
     reasons.push(`RSI ${rsi.toFixed(0)} + price at BB lower ($${bb.lower.toFixed(2)})`);
@@ -657,6 +785,11 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
   if (rsi > 70) {
     score += 35; direction = "PUT";
     reasons.push(`RSI ${rsi.toFixed(0)} — deeply overbought`);
+
+    // #1: Confirmation: RSI dropped BELOW 70 (confirmation candle) ─────────
+    if (prevRSI !== null && prevRSI > 70 && rsi < 70 && rsi > 60) {
+      score += 10; reasons.push("Entry confirmation: RSI broke below 70 (sell signal)");
+    }
   } else if (rsi > 60 && last >= bb.upper * 0.99) {
     score += 28; direction = "PUT";
     reasons.push(`RSI ${rsi.toFixed(0)} + price at BB upper ($${bb.upper.toFixed(2)})`);
@@ -680,7 +813,7 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
 
   if (score < 15) return null; // discard if trend kills the signal
 
-  // ── MACD confirmation (#4) ──────────────────────────────────────────────
+  // ── MACD confirmation ──────────────────────────────────────────────────
   const macd = calcMACD(closes);
   if (macd) {
     if (direction === "CALL" && macd.histogram > 0 && macd.crossUp) {
@@ -693,6 +826,38 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL") {
       score += 5;  reasons.push("MACD negative");
     } else {
       score -= 5;  reasons.push("MACD diverging from signal");
+    }
+  }
+
+  // ── #4: STOCHASTIC RSI CONFIRMATION (avoid false RSI extremes) ──────────
+  const stochRSI = calcStochRSI(closes);
+  if (stochRSI !== null) {
+    if (direction === "CALL" && rsi < 30 && stochRSI < 20) {
+      score += 8; reasons.push(`Stochastic RSI ${stochRSI.toFixed(0)} confirms oversold (strong buy)`);
+    } else if (direction === "PUT" && rsi > 70 && stochRSI > 80) {
+      score += 8; reasons.push(`Stochastic RSI ${stochRSI.toFixed(0)} confirms overbought (strong sell)`);
+    }
+  }
+
+  // ── #2: BOLLINGER SQUEEZE + BREAKOUT (high probability moves) ──────────
+  const bbMetrics = calcBollingerMetrics(closes);
+  if (bbMetrics && bbMetrics.isSqueezed) {
+    score += 12; reasons.push(`Bollinger Squeeze detected (bandwidth: ${(bbMetrics.bandwidth * 100).toFixed(1)}%)`);
+
+    if (direction === "CALL" && bbMetrics.isNearLower) {
+      score += 4; reasons.push("Breaking out ABOVE lower BB band");
+    } else if (direction === "PUT" && bbMetrics.isNearUpper) {
+      score += 4; reasons.push("Breaking out BELOW upper BB band");
+    }
+  }
+
+  // ── #3: SUPPORT/RESISTANCE CONFLUENCE (better entry levels) ────────────
+  const levels = calcSupportResistance(bars);
+  if (levels) {
+    if (direction === "CALL" && levels.nearSupport) {
+      score += 8; reasons.push(`Price near support level ($${levels.support.toFixed(2)}) — strong reversal`);
+    } else if (direction === "PUT" && levels.nearResistance) {
+      score += 8; reasons.push(`Price near resistance level ($${levels.resistance.toFixed(2)}) — strong reversal`);
     }
   }
 
@@ -1139,9 +1304,17 @@ async function runScan(client, webull, force = false) {
     console.warn(`[${etFull()}] Option chain unavailable for ${best.symbol} (geo-blocked API): ${e.message} — using Black-Scholes estimate`);
   }
 
+  // ── #5: Win rate scaling by symbol — concentrate on winning symbols ──────
+  const state = loadState();
+  const symbolMultiplier = getSymbolWinRateMultiplier(best.symbol, state);
+  const scaledBudget = Math.round(budget * symbolMultiplier);
+  if (symbolMultiplier !== 1.0) {
+    console.log(`[${etFull()}] Symbol ${best.symbol}: win rate multiplier ${symbolMultiplier.toFixed(2)}x → adjusted budget $${scaledBudget} (from $${budget})`);
+  }
+
   const position = chainData && chainData.length > 0
-    ? calcOptionPositionFromChain(chainData, best.direction, expiry, budget, best.last, best.atr) // #2: pass spot & ATR for adaptive SL
-    : calcOptionPosition(best.last, best.direction, best.vol, expiry, budget);
+    ? calcOptionPositionFromChain(chainData, best.direction, expiry, scaledBudget, best.last, best.atr) // #5: use scaled budget
+    : calcOptionPosition(best.last, best.direction, best.vol, expiry, scaledBudget);
 
   if (!position) {
     await sendMsg(client,
@@ -1318,6 +1491,10 @@ async function closePosition(client, trade, reason, webull) {
   const state         = loadState();
   state.activeTrades  = state.activeTrades.filter(t => t.id !== trade.id);
   state.closedTrades.push({ ...trade, closedAt: new Date().toISOString(), reason, totalPnL, pct, exitPremium: trade.currentPremium });
+
+  // ── #5: Record win/loss by symbol for position sizing scaling ────────────
+  recordTradeResult(trade.symbol, isWin, state);
+
   saveState(state);
 
   // Performance log
