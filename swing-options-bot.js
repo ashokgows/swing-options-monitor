@@ -1056,6 +1056,38 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
 
 // ── STRATEGY HELPERS ──────────────────────────────────────────────────────
 
+// Market closure check — skip holidays when market is closed
+function isMarketClosed() {
+  const now = new Date();
+  const todayStr = now.toISOString().split('T')[0]; // YYYY-MM-DD format
+
+  // US stock market holidays (2026-2027)
+  const closedDays = [
+    "2026-01-01", // New Year's Day
+    "2026-01-19", // MLK Jr. Day
+    "2026-02-16", // Presidents' Day
+    "2026-03-27", // Good Friday
+    "2026-05-25", // Memorial Day
+    "2026-06-19", // Juneteenth
+    "2026-07-03", // Independence Day (observed)
+    "2026-09-07", // Labor Day
+    "2026-11-26", // Thanksgiving
+    "2026-12-25", // Christmas
+    "2027-01-01", // New Year's Day
+    "2027-01-18", // MLK Jr. Day
+    "2027-02-15", // Presidents' Day
+    "2027-04-16", // Good Friday
+    "2027-05-31", // Memorial Day
+    "2027-06-18", // Juneteenth
+    "2027-07-05", // Independence Day (observed)
+    "2027-09-06", // Labor Day
+    "2027-11-25", // Thanksgiving
+    "2027-12-24", // Christmas (observed, 24th is Friday)
+  ];
+
+  return closedDays.includes(todayStr);
+}
+
 // #1: Time-of-day filter — higher volatility/better odds in morning
 function shouldTradeByTimeOfDay() {
   const { hour, min } = getEtParts();
@@ -1119,6 +1151,10 @@ async function runScan(client, webull, force = false) {
   }
   if (!isMarketHours() && !force) {
     console.log(`[${etFull()}] Scan skipped — outside market hours`);
+    return;
+  }
+  if (isMarketClosed()) {
+    console.log(`[${etFull()}] Scan skipped — US stock market closed (holiday)`);
     return;
   }
 
