@@ -51,9 +51,10 @@ class WebullClient {
     }
     this.axiosClient = axios.create(axiosConfig);
 
-    this._token       = null;
-    this._tokenExpiry = 0;
-    this._debug       = process.env.DEBUG_WEBULL === "true";
+    this._token         = null;
+    this._tokenExpiry   = 0;
+    this._debug         = process.env.DEBUG_WEBULL === "true";
+    this._cachedBalance = null; // Fallback for geo-blocked API calls
   }
 
   // ── CREDENTIALS ───────────────────────────────────────────────────────────
@@ -252,9 +253,52 @@ class WebullClient {
    * Account balance / buying power.
    * Returns {totalValue, buyingPower, cash, ...}
    */
-  async getBalance() {
-    const data = await this.request("GET", `/account/${this.accountId}/balance`);
-    return data?.data || data;
+  async getBalance(retries = 3) {
+    let lastError;
+
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const data = await this.request("GET", `/account/${this.accountId}/balance`);
+        // Cache successful response
+        if (data) {
+          this._cachedBalance = { data: data?.data || data, timestamp: Date.now() };
+        }
+        return data?.data || data;
+      } catch (err) {
+        lastError = err;
+
+        // If geo-blocked (403, CloudFront block), suggest proxy
+        if (err.response?.status === 403 || err.message?.includes("403")) {
+          if (attempt === 0) {
+            log(`⚠️  Webull API geo-blocked (403). Retrying with backoff...`);
+          }
+          // Exponential backoff: 500ms, 1s, 2s
+          if (attempt < retries - 1) {
+            await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+          }
+        } else {
+          // Other errors, retry anyway
+          if (attempt < retries - 1) {
+            await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+          }
+        }
+      }
+    }
+
+    // All retries failed — use cached balance if available
+    if (this._cachedBalance) {
+      const age = ((Date.now() - this._cachedBalance.timestamp) / 1000 / 60).toFixed(1);
+      log(`⚠️  Using cached balance (${age} min old). Configure WEBULL_PROXY_URL to fix geo-blocking.`);
+      return this._cachedBalance.data;
+    }
+
+    // No cache available — throw error with helpful message
+    const msg = lastError?.message || "Unknown error";
+    throw new Error(
+      `getBalance failed after ${retries} retries: ${msg}\n` +
+      `Fix: Set WEBULL_PROXY_URL env var (e.g., WEBULL_PROXY_URL=http://proxy-ip:port)\n` +
+      `Free options: SmartProxy, Bright Data, or other residential proxy service`
+    );
   }
 
   // ── ORDERS ────────────────────────────────────────────────────────────────

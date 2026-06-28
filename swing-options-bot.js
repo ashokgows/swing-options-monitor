@@ -1381,6 +1381,26 @@ async function postMonthlyReport(client) {
 async function handleCommand(client, webull, msg) {
   const cmd = msg.content.trim().toLowerCase();
 
+  // ── !balance ──
+  if (cmd === "!balance") {
+    try {
+      const balance = await webull.getBalance();
+      const cash = (balance.cash || 0).toFixed(2);
+      const bp = (balance.buyingPower || 0).toFixed(2);
+      const total = (balance.totalValue || 0).toFixed(2);
+      await msg.reply(
+        `💰 **Account Balance** — ${etFull()}\n\n` +
+        `• Cash: $${cash}\n` +
+        `• Buying Power: $${bp}\n` +
+        `• Total Value: $${total}`
+      );
+    } catch (err) {
+      const msg1 = err.message.split("\n")[0];
+      await msg.reply(`❌ Balance check failed: ${msg1}\n_Note: Set WEBULL_PROXY_URL to fix geo-blocking_`);
+    }
+    return;
+  }
+
   // ── !scan ──
   if (cmd === "!scan") {
     if (!isMarketHours()) {
