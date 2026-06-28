@@ -1116,7 +1116,7 @@ async function runScan(client, webull, force = false) {
   const isDTE0 = position.expiryDate === etDateStr() ? " 🏃 **0DTE** (expires TODAY)" : "";
 
   const proposalText =
-    `${dirEmoji} **TRADE SETUP** — ${etFull()}\n` +
+    `${dirEmoji} **AUTO-PLACED ORDER** — ${etFull()}\n` +
     `Market: ${trendEmoji} ${marketTrend} · VIX: ${vixInfo.emoji} ${vixInfo.label} · ${setups.length} setup(s)\n` +
     (earningsNote ? earningsNote : "") +
     `\n**${best.symbol} ${best.direction}** · Score: ${best.score}/100\n\n` +
@@ -1127,39 +1127,26 @@ async function runScan(client, webull, force = false) {
     `• Premium:   $${position.premium.toFixed(2)}/contract (×100 shares)\n` +
     `• Contracts: ${position.contracts}\n` +
     `• **Total Cost: $${position.totalCost.toFixed(2)}** (budget: $${budget} — ${budgetSrc})\n` +
-    (priceSource === "Black-Scholes est." ? `⚠️ _**Premium is estimated** — check Webull for actual bid/ask before approving_\n` : "") +
+    (priceSource === "Black-Scholes est." ? `⚠️ _**Premium is estimated** — check Webull for actual bid/ask_\n` : "") +
     `\n🎯 **Exit Strategy (dynamic):**\n` +
-    `• Initial SL: $${position.sl.toFixed(2)} (−20%)\n` +
+    `• Initial SL: $${position.sl.toFixed(2)}\n` +
     `• Profit floor: activates at +15%, trails 12% below peak\n` +
     `• Momentum exit: closes if 5m RSI/price turns against position\n` +
     `• Profit take: closes at +50% if momentum is fading\n\n` +
     (runners ? `📌 Runners-up: ${runners}\n\n` : "") +
-    `_Click ✅ Place Order or ❌ Skip below · 10-min timeout_`;
+    `✅ **Order placed automatically** — Monitoring in progress`;
 
-  const msg = await sendApproval(client, proposalText);
-
-  // Save pending approval
-  state.pendingApproval = {
+  // AUTOMATICALLY PLACE THE ORDER (no user approval needed)
+  await placeTradeOrder(client, webull, {
     symbol:    best.symbol,
     direction: best.direction,
     setup:     { score: best.score, rsi: best.rsi, vol: best.vol, last: best.last, reasons: best.reasons },
     position,
     budget,
-    sentAt:    new Date().toISOString(),
-    msgId:     msg?.id || null,
-  };
-  saveState(state);
+  });
 
-  // Auto-expire approval
-  setTimeout(async () => {
-    const s = loadState();
-    if (s.pendingApproval && s.pendingApproval.sentAt === state.pendingApproval.sentAt) {
-      s.pendingApproval = null;
-      saveState(s);
-      await sendMsg(client, `⏰ **Trade proposal expired** — No response in 10 min. Scanning next cycle.`);
-      console.log(`[${etFull()}] Pending approval for ${best.symbol} expired`);
-    }
-  }, APPROVAL_TIMEOUT);
+  // Send notification to Discord
+  await sendMsg(client, proposalText);
 
   } finally {
     _scanning = false;
