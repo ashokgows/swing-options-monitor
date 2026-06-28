@@ -690,42 +690,70 @@ function calcOptionPosition(spot, direction, dailyVol, expiryDate, budget = MIN_
 /**
  * Like calcOptionPosition but uses real bid/ask from Webull option chain.
  * Picks the ask price, finds the most contracts within budget, filters by OI > 0.
+ *
+ * Smart strike selection: If ATM is too expensive, finds next-closest strike within budget.
+ * This preserves probability of profit while fitting within buying power.
  */
 function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_BUDGET, spotPrice = null) {
-  // #2: Greeks filter — prefer delta 0.4–0.8 (ATM-ish, higher probability, moderate theta)
-  const filtered = chain
-    .filter(c => {
-      if (c.optionType !== direction || c.openInterest <= 0 || c.ask <= 0) return false;
-      // Estimate delta if spot is available
-      if (spotPrice && expiryDate) {
-        const T = daysUntil(expiryDate) / 365;
-        const sigma = 0.25; // rough estimate
-        const delta = Math.abs(calcDelta(spotPrice, c.strikePrice, T, sigma, direction));
-        if (delta < 0.4 || delta > 0.8) return false; // ATM-ish range
+  if (!chain || chain.length === 0) return null;
+
+  // Filter base criteria (type, OI, price)
+  const baseFiltered = chain.filter(c =>
+    c.optionType === direction && c.openInterest > 0 && c.ask > 0
+  );
+
+  if (baseFiltered.length === 0) return null;
+
+  // Strategy: Try progressively wider delta ranges until we find something affordable
+  // This ensures we get closest-to-ATM that fits budget
+  const deltaRanges = [
+    { min: 0.4, max: 0.8, label: "ATM (strict)" },
+    { min: 0.35, max: 0.85, label: "ATM (loose)" },
+    { min: 0.3, max: 0.9, label: "Near-ATM" },
+    { min: 0.2, max: 0.95, label: "Wide range" },
+    { min: 0, max: 1.0, label: "Any delta" },
+  ];
+
+  for (const range of deltaRanges) {
+    const filtered = baseFiltered
+      .filter(c => {
+        // Estimate delta if spot is available
+        if (spotPrice && expiryDate) {
+          const T = daysUntil(expiryDate) / 365;
+          const sigma = 0.25;
+          const delta = Math.abs(calcDelta(spotPrice, c.strikePrice, T, sigma, direction));
+          return delta >= range.min && delta <= range.max;
+        }
+        // If no spot price, accept all
+        return true;
+      })
+      .sort((a, b) => a.ask - b.ask); // cheapest first (closest to ATM in this range)
+
+    for (const c of filtered) {
+      const premium = c.ask;
+      const costPerContract = premium * 100;
+      if (costPerContract < 5) continue;
+      if (costPerContract > budget) continue;
+
+      const contracts = Math.floor(budget / costPerContract);
+      if (contracts < 1) continue;
+
+      const totalCost = Math.round(contracts * costPerContract * 100) / 100;
+      if (range.label !== "ATM (strict)") {
+        console.log(`[${etFull()}] Strike selection: expanded to ${range.label} to fit budget`);
       }
-      return true;
-    })
-    .sort((a, b) => a.ask - b.ask); // cheapest first
-
-  for (const c of filtered) {
-    const premium        = c.ask;
-    const costPerContract = premium * 100;
-    if (costPerContract < 5)     continue;
-    if (costPerContract > budget) continue;
-
-    const contracts = Math.floor(budget / costPerContract);
-    if (contracts < 1) continue;
-
-    const totalCost = Math.round(contracts * costPerContract * 100) / 100;
-    return {
-      strike:    c.strikePrice,
-      expiryDate,
-      premium:   Math.round(premium * 100) / 100,
-      contracts,
-      totalCost,
-      sl:        Math.round(premium * SL_MULT * 100) / 100,
-    };
+      return {
+        strike:    c.strikePrice,
+        expiryDate,
+        premium:   Math.round(premium * 100) / 100,
+        contracts,
+        totalCost,
+        sl:        Math.round(premium * SL_MULT * 100) / 100,
+      };
+    }
   }
+
+  // No affordable strike found
   return null;
 }
 
