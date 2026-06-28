@@ -735,6 +735,12 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
       if (costPerContract < 5) continue;
       if (costPerContract > budget) continue;
 
+      // #2: Liquidity check — skip if spread > 5%
+      if (!hasGoodLiquidity(c.bid, c.ask)) {
+        console.log(`[${etFull()}] Skipped ${c.strikePrice} strike — spread too wide (${((c.ask - c.bid) / ((c.ask + c.bid) / 2) * 100).toFixed(1)}%)`);
+        continue;
+      }
+
       const contracts = Math.floor(budget / costPerContract);
       if (contracts < 1) continue;
 
@@ -755,6 +761,33 @@ function calcOptionPositionFromChain(chain, direction, expiryDate, budget = MIN_
 
   // No affordable strike found
   return null;
+}
+
+// ── STRATEGY HELPERS ──────────────────────────────────────────────────────
+
+// #1: Time-of-day filter — higher volatility/better odds in morning
+function shouldTradeByTimeOfDay() {
+  const { hour, min } = getEtParts();
+  const hhmm = hour * 100 + min;
+
+  // Morning: 9:45-11:30 (high volatility, faster moves) ✅ YES
+  if (hhmm >= 945 && hhmm < 1130) return { ok: true, period: "morning", label: "🌅 Morning (high vol)" };
+
+  // Midday: 11:30-1:30 (choppy, low vol) ❌ SKIP
+  if (hhmm >= 1130 && hhmm < 1330) return { ok: false, period: "midday", label: "☕ Midday (choppy)" };
+
+  // Afternoon: 1:30-3:20 (earnings/news, risky) ✅ YES but monitor closer
+  if (hhmm >= 1330 && hhmm < 1520) return { ok: true, period: "afternoon", label: "🌤️ Afternoon" };
+
+  return { ok: false, period: "outside", label: "⏰ Outside trading hours" };
+}
+
+// #2: Check if option chain has good liquidity
+function hasGoodLiquidity(bid, ask) {
+  if (bid <= 0 || ask <= 0) return false;
+  const mid = (bid + ask) / 2;
+  const spread = (ask - bid) / mid;
+  return spread <= 0.05; // Allow up to 5% spread
 }
 
 // ── DISCORD HELPERS ────────────────────────────────────────────────────────
@@ -915,19 +948,30 @@ async function runScan(client, webull, force = false) {
   let best = null;
   for (const setup of setups) {
     try {
+      // #1: Time-of-day filter (skip midday chop)
+      const timeFilter = shouldTradeByTimeOfDay();
+      if (!timeFilter.ok && timeFilter.period === "midday") {
+        console.log(`[${etFull()}] ${setup.symbol} skipped — ${timeFilter.label} (avoid chop)`);
+        continue;
+      }
+
       const bars5m = await webull.getBars(setup.symbol, "5m", 20);
       if (bars5m && bars5m.length >= 11) {
         const closes5m = bars5m.map(b => b.close);
         const rsi5m    = calcRSI(closes5m, 10);
-        const ok = (setup.direction === "CALL" && rsi5m > 45) ||
-                   (setup.direction === "PUT"  && rsi5m < 55);
-        if (ok) {
-          setup.reasons.push(`5m RSI ${rsi5m.toFixed(0)} confirms ${setup.direction}`);
-          setup.score += 5;
+
+        // #1: Mean reversion filter — require RSI extremes for reversal trades
+        const isMeanReversionSetup =
+          (setup.direction === "CALL" && rsi5m < 30) ||  // Oversold for CALL
+          (setup.direction === "PUT" && rsi5m > 70);      // Overbought for PUT
+
+        if (isMeanReversionSetup) {
+          setup.reasons.push(`5m RSI ${rsi5m.toFixed(0)} extreme — mean reversion confirmed`);
+          setup.score += 8;  // Bonus for mean reversion
           best = setup;
           break;
         } else {
-          console.log(`[${etFull()}] ${setup.symbol} skipped — 5m RSI ${rsi5m.toFixed(0)} not confirming ${setup.direction}`);
+          console.log(`[${etFull()}] ${setup.symbol} skipped — 5m RSI ${rsi5m.toFixed(0)} not extreme enough (need <30 for CALL or >70 for PUT)`);
         }
       } else {
         best = setup; // can't confirm, take the daily signal
