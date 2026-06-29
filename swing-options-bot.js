@@ -1490,16 +1490,20 @@ async function runScan(client, webull, force = false) {
       if (r.value._earningsSkip) { earningsSkipped++; continue; }
       if (r.value._ivSkip) { ivSkipped++; continue; }
       // Collect ALL scores for reporting (both passed and failed)
-      allScores.push(r.value);
-      // Only execute trades with score >= 80
-      if (r.value.score >= MIN_SCORE) {
-        setups.push(r.value);
+      if (r.value.score !== undefined) {
+        allScores.push(r.value);
+        // Only execute trades with score >= 80
+        if (r.value.score >= MIN_SCORE) {
+          setups.push(r.value);
+        }
       }
     }
   }
 
   const earningsNote = earningsSkipped > 0 ? `⚠️ ${earningsSkipped} symbols skipped (earnings risk) · ` : "";
   const ivNote = ivSkipped > 0 ? `${ivSkipped} symbols skipped (IV rank mid-range)` : "";
+
+  console.log(`[${etFull()}] Score collection: ${allScores.length} symbols scored, ${setups.length} passed 80+ threshold`);
 
   // ── LOG ALL SCORES: Passed (80+) and Failed (< 80) ──────────────────────
   const passed = allScores.filter(s => s.score >= MIN_SCORE).sort((a, b) => b.score - a.score);
