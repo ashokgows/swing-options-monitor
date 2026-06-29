@@ -1496,12 +1496,29 @@ async function runScan(client, webull, force = false) {
   const earningsNote = earningsSkipped > 0 ? `⚠️ ${earningsSkipped} symbols skipped (earnings risk) · ` : "";
   const ivNote = ivSkipped > 0 ? `${ivSkipped} symbols skipped (IV rank mid-range)` : "";
 
+  // ── LOG ALL SCORES: Passed (80+) and Failed (< 80) ──────────────────────
+  const passed = setups.filter(s => s.score >= MIN_SCORE).sort((a, b) => b.score - a.score);
+  const failed = setups.filter(s => s.score < MIN_SCORE).sort((a, b) => b.score - a.score);
+
+  let scoreReport = `📊 **SCAN RESULTS** _(${etFull()})_\n\n`;
+  scoreReport += `✅ **PASSED (${passed.length}) — Score 80+:**\n`;
+  if (passed.length > 0) {
+    scoreReport += passed.slice(0, 10).map(s => `• ${s.symbol} ${s.direction}: **${s.score}/100**`).join("\n");
+    if (passed.length > 10) scoreReport += `\n_(+${passed.length - 10} more)_`;
+  } else {
+    scoreReport += "_(none)_";
+  }
+  scoreReport += `\n\n❌ **FAILED (${failed.length}) — Score < 80:**\n`;
+  if (failed.length > 0) {
+    scoreReport += failed.slice(0, 10).map(s => `• ${s.symbol} ${s.direction}: ${s.score}/100`).join("\n");
+    if (failed.length > 10) scoreReport += `\n_(+${failed.length - 10} more)_`;
+  } else {
+    scoreReport += "_(none)_";
+  }
+  scoreReport += `\n\n${earningsNote}${ivNote}\nVIX: ${vixInfo.emoji} ${vixInfo.label}`;
+
   if (setups.length === 0) {
-    await sendMsg(client,
-      `🔍 **SCAN COMPLETE** — No qualifying setups found _(${etFull()})_\n` +
-      (earningsNote || ivNote ? `${earningsNote}${ivNote}\n` : "") +
-      `VIX: ${vixInfo.emoji} ${vixInfo.label}`
-    );
+    await sendMsg(client, scoreReport);
     return;
   }
 
