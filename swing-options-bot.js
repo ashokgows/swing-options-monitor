@@ -987,35 +987,35 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL", state = null) {
   const prevRSI = closes.length >= 2 ? calcRSI(closes.slice(0, -1), 5) : null;
 
   // ── Bullish signals → CALL ──
-  if (rsi < 30) {
+  if (rsi < 45) {
     score += 35; direction = "CALL";
-    reasons.push(`RSI ${rsi.toFixed(0)} — deeply oversold`);
+    reasons.push(`RSI ${rsi.toFixed(0)} — oversold`);
 
-    // #1: Confirmation: RSI bounced ABOVE 30 (confirmation candle) ─────────
-    if (prevRSI !== null && prevRSI < 30 && rsi > 30 && rsi < 40) {
-      score += 10; reasons.push("Entry confirmation: RSI bounced off 30 (buy signal)");
+    // #1: Confirmation: RSI bounced ABOVE 45 (confirmation candle) ─────────
+    if (prevRSI !== null && prevRSI < 45 && rsi > 45 && rsi < 50) {
+      score += 10; reasons.push("Entry confirmation: RSI bounced off 45 (buy signal)");
     }
-  } else if (rsi < 40 && last <= bb.lower * 1.01) {
+  } else if (rsi < 50 && last <= bb.lower * 1.01) {
     score += 28; direction = "CALL";
     reasons.push(`RSI ${rsi.toFixed(0)} + price at BB lower ($${bb.lower.toFixed(2)})`);
-  } else if (rsi < 45 && last <= bb.lower * 1.005) {
+  } else if (rsi < 52 && last <= bb.lower * 1.005) {
     score += 20; direction = "CALL";
     reasons.push(`Price at BB lower, RSI ${rsi.toFixed(0)}`);
   }
 
   // ── Bearish signals → PUT ──
-  if (rsi > 70) {
+  if (rsi > 55) {
     score += 35; direction = "PUT";
-    reasons.push(`RSI ${rsi.toFixed(0)} — deeply overbought`);
+    reasons.push(`RSI ${rsi.toFixed(0)} — overbought`);
 
-    // #1: Confirmation: RSI dropped BELOW 70 (confirmation candle) ─────────
-    if (prevRSI !== null && prevRSI > 70 && rsi < 70 && rsi > 60) {
-      score += 10; reasons.push("Entry confirmation: RSI broke below 70 (sell signal)");
+    // #1: Confirmation: RSI dropped BELOW 55 (confirmation candle) ─────────
+    if (prevRSI !== null && prevRSI > 55 && rsi < 55 && rsi > 50) {
+      score += 10; reasons.push("Entry confirmation: RSI broke below 55 (sell signal)");
     }
-  } else if (rsi > 60 && last >= bb.upper * 0.99) {
+  } else if (rsi > 50 && last >= bb.upper * 0.99) {
     score += 28; direction = "PUT";
     reasons.push(`RSI ${rsi.toFixed(0)} + price at BB upper ($${bb.upper.toFixed(2)})`);
-  } else if (rsi > 55 && last >= bb.upper * 0.995) {
+  } else if (rsi > 48 && last >= bb.upper * 0.995) {
     score += 20; direction = "PUT";
     reasons.push(`Price at BB upper, RSI ${rsi.toFixed(0)}`);
   }
