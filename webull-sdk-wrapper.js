@@ -78,12 +78,11 @@ class WebullSDKWrapper {
 
       const code = `
 import json
-from webull_openapi import ApiClient
+from webull.trade.trade_client import TradeClient
 
-client = ApiClient(
+client = TradeClient(
     app_key="${this.appKey}",
-    app_secret="${this.appSecret}",
-    region_id="us"
+    app_secret="${this.appSecret}"
 )
 bars = client.get_bars(
     symbol="${symbol.toUpperCase()}",
@@ -110,12 +109,11 @@ print(json.dumps(bars if bars else []))
 
       const code = `
 import json
-from webull_openapi import ApiClient
+from webull.trade.trade_client import TradeClient
 
-client = ApiClient(
+client = TradeClient(
     app_key="${this.appKey}",
-    app_secret="${this.appSecret}",
-    region_id="us"
+    app_secret="${this.appSecret}"
 )
 account = client.get_account_balance(account_id="${this.accountId}")
 print(json.dumps({
@@ -147,12 +145,11 @@ print(json.dumps({
 
       const code = `
 import json
-from webull_openapi import ApiClient
+from webull.trade.trade_client import TradeClient
 
-client = ApiClient(
+client = TradeClient(
     app_key="${this.appKey}",
-    app_secret="${this.appSecret}",
-    region_id="us"
+    app_secret="${this.appSecret}"
 )
 chain = client.get_option_chain(
     symbol="${symbol.toUpperCase()}",
@@ -179,12 +176,11 @@ print(json.dumps(chain if chain else []))
 
       const code = `
 import json
-from webull_openapi import ApiClient
+from webull.trade.trade_client import TradeClient
 
-client = ApiClient(
+client = TradeClient(
     app_key="${this.appKey}",
-    app_secret="${this.appSecret}",
-    region_id="us"
+    app_secret="${this.appSecret}"
 )
 order_result = client.place_option_order(
     account_id="${this.accountId}",
