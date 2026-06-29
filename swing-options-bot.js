@@ -19,7 +19,7 @@ const {
 } = require("discord.js");
 const fs   = require("fs");
 const path = require("path");
-const WebullClient = require("./webull-sdk-wrapper"); // ✅ Using official Webull Python SDK
+const WebullClient = require("./webull-integration"); // Using direct API with correct endpoints
 
 // ── CONSTANTS ──────────────────────────────────────────────────────────────
 
