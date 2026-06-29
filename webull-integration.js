@@ -29,10 +29,10 @@ class WebullClient {
     this.whitelistArr = (process.env.WEBULL_SYMBOL_WHITELIST || "")
       .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
 
-    // Base URL — swap for UAT when needed
+    // Base URL — Production event endpoint (updated from openapi.webull.com)
     this.baseUrl = this.environment === "prod"
-      ? "https://openapi.webull.com/openapi"
-      : "https://openapi-test.webull.com/openapi";
+      ? "https://events-api.webull.com/openapi"
+      : "https://events-api.webull.com/openapi";
 
     // Axios client with proxy support (if WEBULL_PROXY_URL is set)
     const proxyUrl = process.env.WEBULL_PROXY_URL;
