@@ -1486,11 +1486,15 @@ async function runScan(client, webull, force = false) {
       })
     );
     for (const r of results) {
-      if (r.status !== "fulfilled" || !r.value) continue;
+      if (r.status !== "fulfilled") continue;
+      if (!r.value) continue;
+
+      // Handle special filter markers
       if (r.value._earningsSkip) { earningsSkipped++; continue; }
       if (r.value._ivSkip) { ivSkipped++; continue; }
-      // Collect ALL scores for reporting (both passed and failed)
-      if (r.value.score !== undefined) {
+
+      // Collect ALL scored symbols (both passed 80+ and failed <80)
+      if (typeof r.value.score === "number") {
         allScores.push(r.value);
         // Only execute trades with score >= 80
         if (r.value.score >= MIN_SCORE) {
