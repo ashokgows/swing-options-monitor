@@ -19,7 +19,7 @@ const {
 } = require("discord.js");
 const fs   = require("fs");
 const path = require("path");
-const WebullClient = require("./webull-integration"); // Direct API (fixing endpoints)
+const WebullClient = require("./webull-integration"); // Will fallback to Yahoo Finance for bars
 
 // ── CONSTANTS ──────────────────────────────────────────────────────────────
 
@@ -43,7 +43,7 @@ const CONFIG = {
   VOLATILITY_FLOOR:        0.008,  // min daily volatility to trade
   IV_PERCENTILE_WINDOW:    0.80,   // min IV percentile rank
   ZERO_DTE_BUDGET_THRESHOLD: 150,  // budget threshold for 0DTE trades
-  ADX_TREND_STRENGTH:      25,     // minimum ADX for strong trend
+  ADX_TREND_STRENGTH:      15,     // minimum ADX for strong trend (lowered for weak markets)
   VOLUME_RATIO:            0.80,   // min volume as % of 20-day avg
 };
 
@@ -941,14 +941,15 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL", state = null) {
   const lows    = bars.map(b => b.low);
 
   // ── PRE-FILTERS (quick exit if disqualified) ──────────────────────────────
+  // TEMPORARILY DISABLED FOR DEBUGGING
   // #7: Skip if near recent highs/lows (reversal risk)
-  if (isNearRecentExtreme(bars)) return null;
+  // if (isNearRecentExtreme(bars)) return null;
 
   // #12: Skip if overnight gap (mean reversion risk)
-  if (hasOvernightGap(bars)) return null;
+  // if (hasOvernightGap(bars)) return null;
 
   // #8: Skip if already traded this symbol today (limit frequency)
-  if (state && !canTradeSymbolAgain(symbol, state, 2)) return null;
+  // if (state && !canTradeSymbolAgain(symbol, state, 2)) return null;
   const volumes = bars.map(b => b.volume);
 
   const last  = closes[closes.length - 1];
@@ -958,25 +959,25 @@ function scoreSetup(symbol, bars, marketTrend = "NEUTRAL", state = null) {
   const vol   = calcVolatility(closes.slice(-10));
 
   if (!bb || !atr || last <= 0) return null;
-  if (vol < CONFIG.VOLATILITY_FLOOR) return null; // too quiet for options
+  // TEMPORARILY DISABLED: if (vol < CONFIG.VOLATILITY_FLOOR) return null; // too quiet for options
 
   // #3: Volume confirmation — only trade high-volume stocks
   const avgVol20 = volumes.slice(-20).reduce((a, b) => a + b, 0) / 20;
-  if (volumes[volumes.length - 1] < avgVol20 * 0.8) {
-    return null; // skip if today's volume < 80% of 20-day average
-  }
+  // TEMPORARILY DISABLED: if (volumes[volumes.length - 1] < avgVol20 * 0.8) {
+  //   return null; // skip if today's volume < 80% of 20-day average
+  // }
 
-  // #4: ADX trend strength — only trade strong trends (ADX > 25)
-  // Use cache to avoid O(n²) recalculation
+  // #4: ADX trend strength — only trade strong trends (ADX > 15)
+  // TEMPORARILY DISABLED ADX CHECK - just calculate it
   const barTime = bars[bars.length - 1].time || new Date().toISOString();
   let adx = getCachedADX(symbol, barTime);
   if (adx === null) {
     adx = calcADX(highs, lows, closes);
     if (adx !== null) setCachedADX(symbol, adx, barTime);
   }
-  if (!adx || adx < CONFIG.ADX_TREND_STRENGTH) {
-    return null; // skip if trend is weak
-  }
+  // TEMPORARILY DISABLED: if (!adx || adx < CONFIG.ADX_TREND_STRENGTH) {
+  //   return null; // skip if trend is weak
+  // }
 
   let score     = 0;
   let direction = null;

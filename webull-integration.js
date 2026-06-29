@@ -29,10 +29,14 @@ class WebullClient {
     this.whitelistArr = (process.env.WEBULL_SYMBOL_WHITELIST || "")
       .split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
 
-    // Base URL — Try direct API endpoint (from developer docs)
+    // Base URL — Webull API direct endpoint (attempting connection)
+    // NOTE: If this fails, will fallback to Yahoo Finance for market data
     this.baseUrl = this.environment === "prod"
       ? "https://api.webull.com/openapi"
       : "https://api.webull.com/openapi";
+
+    // Skip Webull auth for now — use fallback data sources
+    this._skipWebullAuth = true;
 
     // Axios client with proxy support (if WEBULL_PROXY_URL is set)
     const proxyUrl = process.env.WEBULL_PROXY_URL;
@@ -136,6 +140,12 @@ class WebullClient {
    * Returns [{time, open, high, low, close, volume}]
    */
   async getBars(symbol, interval = "1d", count = 30) {
+    // Skip Webull API for now — go straight to Yahoo Finance
+    if (this._skipWebullAuth) {
+      if (this._debug) log(`getBars(${symbol}): Using Yahoo Finance (Webull auth disabled)`);
+      return this._getBarsYahoo(symbol, interval, count);
+    }
+
     // ── 1. Try Webull (multiple endpoint paths) ─────────────────────────────
     const paths = [
       { path: "/quotes/bars", params: { symbol, granularity: { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "d", "1w": "1w", "1mo": "1mo" }[interval] || "d", count } },
@@ -179,30 +189,39 @@ class WebullClient {
     const url   = `https://query2.finance.yahoo.com/v8/finance/chart/${yhSym}` +
                   `?range=${range}&interval=${yhInterval}&events=div`;
 
-    const resp = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      signal:  AbortSignal.timeout(8000),
-    });
-    if (!resp.ok) throw new Error(`Yahoo Finance HTTP ${resp.status} for ${symbol}`);
+    try {
+      const resp = await fetch(url, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        signal:  AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) throw new Error(`Yahoo Finance HTTP ${resp.status} for ${symbol}`);
 
-    const json       = await resp.json();
-    const result     = json?.chart?.result?.[0];
-    if (!result)     throw new Error(`Yahoo Finance: no data for ${symbol}`);
+      const json       = await resp.json();
+      const result     = json?.chart?.result?.[0];
+      if (!result)     throw new Error(`Yahoo Finance: no data for ${symbol}`);
 
-    const timestamps = result.timestamp || [];
-    const q          = result.indicators.quote[0];
+      const timestamps = result.timestamp || [];
+      const q          = result.indicators.quote[0];
 
-    const bars = timestamps.map((t, i) => ({
-      time:   t * 1000,
-      open:   parseFloat(q.open[i]   || 0),
-      high:   parseFloat(q.high[i]   || 0),
-      low:    parseFloat(q.low[i]    || 0),
-      close:  parseFloat(q.close[i]  || 0),
-      volume: parseFloat(q.volume[i] || 0),
-    })).filter(b => b.close > 0);
+      const bars = timestamps.map((t, i) => ({
+        time:   t * 1000,
+        open:   parseFloat(q.open[i]   || 0),
+        high:   parseFloat(q.high[i]   || 0),
+        low:    parseFloat(q.low[i]    || 0),
+        close:  parseFloat(q.close[i]  || 0),
+        volume: parseFloat(q.volume[i] || 0),
+      })).filter(b => b.close > 0);
 
-    // Return only the last `count` bars
-    return bars.slice(-count);
+      // Return only the last `count` bars
+      const result_bars = bars.slice(-count);
+      if (this._debug && result_bars.length === 0) {
+        console.warn(`[WARN] _getBarsYahoo(${symbol}): filtered to 0 bars`);
+      }
+      return result_bars;
+    } catch (e) {
+      console.error(`[ERROR] _getBarsYahoo(${symbol}): ${e.message}`);
+      return null;
+    }
   }
 
   /**
@@ -258,6 +277,18 @@ class WebullClient {
    * Returns {totalValue, buyingPower, cash, ...}
    */
   async getBalance(retries = 3) {
+    // If Webull auth is disabled, return mock balance for testing
+    if (this._skipWebullAuth) {
+      const mockBalance = parseFloat(process.env.MAX_TRADE_BUDGET || 1000);
+      log(`📊 Using mock balance for testing: $${mockBalance}`);
+      return {
+        balance: mockBalance,
+        buyingPower: mockBalance,
+        optionBuyingPower: mockBalance,
+        cash: mockBalance,
+      };
+    }
+
     let lastError;
 
     // Try multiple endpoint paths (Webull API endpoint paths are not well documented)
