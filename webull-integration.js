@@ -339,7 +339,7 @@ class WebullClient {
   async placeOptionOrder(order) {
     this.validateCredentials();
 
-    const { optionType, strike, expiryDate, quantity, limitPrice } = order;
+    const { optionType, strike, expiryDate, quantity, limitPrice, symbol, side } = order;
 
     // Validate required options-specific fields
     if (!["CALL", "PUT"].includes(optionType)) throw new Error(`optionType must be CALL or PUT, got: ${optionType}`);
@@ -347,28 +347,55 @@ class WebullClient {
     if (!expiryDate) throw new Error("expiryDate is required for option orders");
     if (quantity > this.maxOrderQty) throw new Error(`quantity ${quantity} exceeds max ${this.maxOrderQty}`);
 
-    // Webull expiry format: YYYYMMDD
-    const expiry = expiryDate.replace(/-/g, "");
+    // Generate unique client order ID
+    const clientOrderId = `bo_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
+    // Format: YYYY-MM-DD (Webull format for option_expire_date)
+    const expiryFormatted = expiryDate.includes("-") ? expiryDate :
+      `${expiryDate.substr(0, 4)}-${expiryDate.substr(4, 2)}-${expiryDate.substr(6, 2)}`;
+
+    // Correct Webull Options API format (from docs)
     const body = {
-      symbol:      order.symbol,
-      qty:         quantity,
-      action:      (order.side || "BUY").toUpperCase(),
-      orderType:   "LMT",
-      lmtPrice:    limitPrice.toFixed(2),
-      timeInForce: order.timeInForce || "DAY",
-      // Option-specific fields
-      optionType:   optionType,   // CALL | PUT
-      strikePrice:  strike.toFixed(2),
-      expireDate:   expiry,       // YYYYMMDD
+      account_id: this.accountId,
+      new_orders: [
+        {
+          client_order_id: clientOrderId,
+          combo_type: "NORMAL",
+          order_type: limitPrice ? "LIMIT" : "MARKET",
+          limit_price: limitPrice ? limitPrice.toFixed(2) : undefined,
+          quantity: quantity.toString(),
+          option_strategy: "SINGLE",
+          side: (side || "BUY").toUpperCase(),
+          time_in_force: order.timeInForce || "DAY",
+          entrust_type: "QTY",
+          instrument_type: "OPTION",
+          market: "US",
+          symbol: symbol.toUpperCase(),
+          legs: [
+            {
+              side: (side || "BUY").toUpperCase(),
+              quantity: quantity.toString(),
+              symbol: symbol.toUpperCase(),
+              strike_price: strike.toFixed(2),
+              option_expire_date: expiryFormatted,
+              instrument_type: "OPTION",
+              option_type: optionType.toUpperCase(),
+              market: "US",
+            },
+          ],
+        },
+      ],
     };
 
-    log(`Placing ${optionType} order: ${order.symbol} $${strike} exp ${expiry} x${quantity} @ $${limitPrice.toFixed(2)}`);
+    // Remove limit_price if undefined (for MARKET orders)
+    if (!limitPrice) delete body.new_orders[0].limit_price;
 
-    const data = await this.request("POST", `/account/${this.accountId}/option-orders/place`, body);
-    const res  = data?.data || data;
+    log(`Placing ${optionType} order: ${symbol} $${strike} exp ${expiryFormatted} x${quantity}${limitPrice ? ` @ $${limitPrice.toFixed(2)}` : " MKT"}`);
 
-    const orderId = res?.orderId || res?.order_id || res?.id || `wb_${Date.now()}`;
+    const data = await this.request("POST", `/orders/place`, body);
+    const res  = data?.data || data?.orders?.[0] || data;
+
+    const orderId = res?.orderId || res?.order_id || res?.id || clientOrderId;
     log(`Order placed — ID: ${orderId}`);
     return { orderId, status: res?.status || "SUBMITTED", raw: res };
   }
@@ -380,20 +407,47 @@ class WebullClient {
    */
   async closeOptionOrder(trade, qty = null) {
     const contracts = qty ?? trade.position.contracts;
+    const clientOrderId = `bc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Format expiry date correctly (YYYY-MM-DD)
+    const expiryDate = trade.position.expiryDate.includes("-")
+      ? trade.position.expiryDate
+      : `${trade.position.expiryDate.substr(0, 4)}-${trade.position.expiryDate.substr(4, 2)}-${trade.position.expiryDate.substr(6, 2)}`;
+
     const body = {
-      symbol:      trade.symbol,
-      qty:         contracts,
-      action:      "SELL",
-      orderType:   "MKT",
-      timeInForce: "DAY",
-      optionType:  trade.direction,
-      strikePrice: trade.position.strike.toFixed(2),
-      expireDate:  trade.position.expiryDate.replace(/-/g, ""),
+      account_id: this.accountId,
+      new_orders: [
+        {
+          client_order_id: clientOrderId,
+          combo_type: "NORMAL",
+          order_type: "MARKET",
+          quantity: contracts.toString(),
+          option_strategy: "SINGLE",
+          side: "SELL",
+          time_in_force: "DAY",
+          entrust_type: "QTY",
+          instrument_type: "OPTION",
+          market: "US",
+          symbol: trade.symbol.toUpperCase(),
+          legs: [
+            {
+              side: "SELL",
+              quantity: contracts.toString(),
+              symbol: trade.symbol.toUpperCase(),
+              strike_price: trade.position.strike.toFixed(2),
+              option_expire_date: expiryDate,
+              instrument_type: "OPTION",
+              option_type: trade.direction.toUpperCase(),
+              market: "US",
+            },
+          ],
+        },
+      ],
     };
 
     log(`Closing ${trade.direction}: ${trade.symbol} x${contracts}${qty ? ` (partial of ${trade.position.contracts})` : ""}`);
-    const data = await this.request("POST", `/account/${this.accountId}/option-orders/place`, body);
-    return data?.data || data;
+    const data = await this.request("POST", `/orders/place`, body);
+    return data?.data || data?.orders?.[0] || data;
   }
 
   /**
