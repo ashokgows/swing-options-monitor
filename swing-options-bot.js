@@ -19,7 +19,7 @@ const {
 } = require("discord.js");
 const fs   = require("fs");
 const path = require("path");
-const WebullClient = require("./webull-mcp-client"); // ✅ Using MCP connector instead of direct API
+const WebullClient = require("./webull-integration"); // Back to direct API
 
 // ── CONSTANTS ──────────────────────────────────────────────────────────────
 
