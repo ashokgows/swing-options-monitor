@@ -1466,6 +1466,7 @@ async function runScan(client, webull, force = false) {
 
   // ── 2b. Scan symbols in parallel batches of 10 ──────────────────────────
   const setups         = [];
+  const allScores      = []; // Track ALL scores for reporting (passed + failed)
   let   earningsSkipped = 0;
   let   ivSkipped       = 0; // #4: IV filter
   const BATCH_SIZE     = 25; // Increased for 300-symbol coverage (parallel execution handles it)
@@ -1488,8 +1489,12 @@ async function runScan(client, webull, force = false) {
       if (r.status !== "fulfilled" || !r.value) continue;
       if (r.value._earningsSkip) { earningsSkipped++; continue; }
       if (r.value._ivSkip) { ivSkipped++; continue; }
-      if (r.value.score < MIN_SCORE) continue; // #1: skip low-conviction
-      setups.push(r.value);
+      // Collect ALL scores for reporting (both passed and failed)
+      allScores.push(r.value);
+      // Only execute trades with score >= 80
+      if (r.value.score >= MIN_SCORE) {
+        setups.push(r.value);
+      }
     }
   }
 
@@ -1497,10 +1502,12 @@ async function runScan(client, webull, force = false) {
   const ivNote = ivSkipped > 0 ? `${ivSkipped} symbols skipped (IV rank mid-range)` : "";
 
   // ── LOG ALL SCORES: Passed (80+) and Failed (< 80) ──────────────────────
-  const passed = setups.filter(s => s.score >= MIN_SCORE).sort((a, b) => b.score - a.score);
-  const failed = setups.filter(s => s.score < MIN_SCORE).sort((a, b) => b.score - a.score);
+  const passed = allScores.filter(s => s.score >= MIN_SCORE).sort((a, b) => b.score - a.score);
+  const failed = allScores.filter(s => s.score < MIN_SCORE).sort((a, b) => b.score - a.score);
+  const maxScore = allScores.length > 0 ? Math.max(...allScores.map(s => s.score)) : 0;
 
-  let scoreReport = `📊 **SCAN RESULTS** _(${etFull()})_\n\n`;
+  let scoreReport = `📊 **SCAN RESULTS** _(${etFull()})_\n`;
+  scoreReport += `📈 **Max Score: ${maxScore}/100** · Scanned: ${allScores.length} symbols\n\n`;
   scoreReport += `✅ **PASSED (${passed.length}) — Score 80+:**\n`;
   if (passed.length > 0) {
     scoreReport += passed.slice(0, 10).map(s => `• ${s.symbol} ${s.direction}: **${s.score}/100**`).join("\n");
