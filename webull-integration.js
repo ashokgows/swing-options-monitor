@@ -136,26 +136,30 @@ class WebullClient {
    * Returns [{time, open, high, low, close, volume}]
    */
   async getBars(symbol, interval = "1d", count = 30) {
-    // ── 1. Try Webull ────────────────────────────────────────────────────────
-    try {
-      const granMap = {
-        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-        "1h": "1h", "1d": "d",  "1w": "1w",   "1mo": "1mo",
-      };
-      const data = await this.request("GET", "/quotes/bars", null, {
-        symbol, granularity: granMap[interval] || "d", count,
-      });
-      const raw = (data?.data) ? data.data : (Array.isArray(data) ? data : []);
-      const bars = raw.map(b => ({
-        time:   b.timestamp || b.time || b.t,
-        open:   parseFloat(b.open   || b.o),
-        high:   parseFloat(b.high   || b.h),
-        low:    parseFloat(b.low    || b.l),
-        close:  parseFloat(b.close  || b.c),
-        volume: parseFloat(b.volume || b.v || 0),
-      })).filter(b => b.close > 0);
-      if (bars.length > 0) return bars;
-    } catch { /* fall through to Yahoo Finance */ }
+    // ── 1. Try Webull (multiple endpoint paths) ─────────────────────────────
+    const paths = [
+      { path: "/quotes/bars", params: { symbol, granularity: { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "d", "1w": "1w", "1mo": "1mo" }[interval] || "d", count } },
+      { path: "/stock/bars", params: { symbol, timeframe: interval, limit: count } },
+      { path: "/market/bars", params: { symbol, timeframe: interval, limit: count } },
+    ];
+
+    for (const { path, params } of paths) {
+      try {
+        const data = await this.request("GET", path, null, params);
+        const raw = (data?.data) ? data.data : (Array.isArray(data) ? data : []);
+        const bars = raw.map(b => ({
+          time:   b.timestamp || b.time || b.t,
+          open:   parseFloat(b.open   || b.o),
+          high:   parseFloat(b.high   || b.h),
+          low:    parseFloat(b.low    || b.l),
+          close:  parseFloat(b.close  || b.c),
+          volume: parseFloat(b.volume || b.v || 0),
+        })).filter(b => b.close > 0);
+        if (bars.length > 0) return bars;
+      } catch (e) {
+        if (this._debug) log(`getBars path ${path} failed: ${e.message}`);
+      }
+    }
 
     // ── 2. Fallback: Yahoo Finance (no API key, accessible from cloud VMs) ───
     return this._getBarsYahoo(symbol, interval, count);
@@ -256,32 +260,33 @@ class WebullClient {
   async getBalance(retries = 3) {
     let lastError;
 
-    for (let attempt = 0; attempt < retries; attempt++) {
-      try {
-        const data = await this.request("GET", `/account/${this.accountId}/balance`);
-        // Cache successful response
-        if (data) {
-          this._cachedBalance = { data: data?.data || data, timestamp: Date.now() };
-        }
-        return data?.data || data;
-      } catch (err) {
-        lastError = err;
+    // Try multiple endpoint paths (Webull API endpoint paths are not well documented)
+    const paths = [
+      `/portfolio/accounts/${this.accountId}`,
+      `/accounts/${this.accountId}`,
+      `/account/${this.accountId}/balance`,
+      `/portfolio/account`,
+      `/user/account`,
+    ];
 
-        // If geo-blocked (403, CloudFront block), suggest proxy
-        if (err.response?.status === 403 || err.message?.includes("403")) {
-          if (attempt === 0) {
-            log(`⚠️  Webull API geo-blocked (403). Retrying with backoff...`);
+    for (let attempt = 0; attempt < retries; attempt++) {
+      for (const path of paths) {
+        try {
+          const data = await this.request("GET", path);
+          // Cache successful response
+          if (data) {
+            this._cachedBalance = { data: data?.data || data, timestamp: Date.now() };
           }
-          // Exponential backoff: 500ms, 1s, 2s
-          if (attempt < retries - 1) {
-            await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
-          }
-        } else {
-          // Other errors, retry anyway
-          if (attempt < retries - 1) {
-            await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
-          }
+          return data?.data || data;
+        } catch (err) {
+          lastError = err;
+          // Continue to next path
+          if (this._debug) log(`Path ${path} failed: ${err.message}`);
         }
+      }
+      // All paths failed for this attempt, wait before retry
+      if (attempt < retries - 1) {
+        await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
       }
     }
 
