@@ -1485,9 +1485,12 @@ async function runScan(client, webull, force = false) {
         return scoreSetup(symbol, bars, marketTrend, state);
       })
     );
+    let resultCount = 0;
     for (const r of results) {
       if (r.status !== "fulfilled") continue;
       if (!r.value) continue;
+
+      resultCount++;
 
       // Handle special filter markers
       if (r.value._earningsSkip) { earningsSkipped++; continue; }
@@ -1502,6 +1505,7 @@ async function runScan(client, webull, force = false) {
         }
       }
     }
+    console.log(`[${etFull()}] Batch results: ${resultCount} returned, ${earningsSkipped} earnings-skipped, ${ivSkipped} iv-skipped, ${allScores.length} scored`);
   }
 
   const earningsNote = earningsSkipped > 0 ? `⚠️ ${earningsSkipped} symbols skipped (earnings risk) · ` : "";
