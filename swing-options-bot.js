@@ -291,7 +291,7 @@ async function calcTradeBudget(webull) {
       s.lastKnownBalance = bp;
       saveState(s);
 
-      const ratio   = bp < 300 ? 0.95 : 0.50;
+      const ratio   = 1.0; // Use 100% of balance for maximum position sizing
       let dynamic = Math.round(bp * ratio);
 
       // #3: Scale by recent win rate — 0% WR → 50% of dynamic, 100% WR → 150% of dynamic
@@ -299,7 +299,7 @@ async function calcTradeBudget(webull) {
 
       const budget  = Math.min(Math.max(dynamic, MIN_BUDGET), ABSOLUTE_MAX_BUDGET);
       const winRate = Math.round(calcRecentWinRate() * 100);
-      console.log(`[${etFull()}] Balance: $${bp.toFixed(2)} → budget $${budget} (${Math.round(ratio * 100)}% base, scaled by ${winRate}% win rate)`);
+      console.log(`[${etFull()}] Balance: $${bp.toFixed(2)} → budget $${budget} (100% of balance, scaled by ${winRate}% win rate)`);
       return budget;
     }
   } catch (e) {
